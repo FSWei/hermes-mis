@@ -144,6 +144,11 @@ Memory是索引，Skill是存储。看到"详见skill xxx"必须加载。
 
 ## 项目工作
 涉及项目 → 先读memory找到索引 → skill_view加载 → 再动手。
+
+## 待办管理
+用户说"帮我记一下"/"记待办"/"添加TODO" → 读取 todo-list skill → 追加待办项。
+用户说"看看待办" → 读取 todo-list skill → 展示列表。
+待办事项只存在 todo-list skill 中，不写 Memory。
 ```
 
 **保留的个性化规则（不要删除）：**
