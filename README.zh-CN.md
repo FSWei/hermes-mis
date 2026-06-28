@@ -20,24 +20,25 @@ MIS (Memory-Index-Skill) 方案把 Memory 拆成三层：
 
 ## 快速开始
 
-### 方式一：手动安装
+### 方式一：一句话安装（推荐）
+
+对 Hermes 说：
+```
+从 https://github.com/FSWei/hermes-mis 安装 skill
+```
+
+或使用命令行：
+```bash
+hermes skills install https://github.com/FSWei/hermes-mis
+```
+
+然后说：`启用记忆优化`
+
+### 方式二：手动安装
 
 1. 把 `SKILL.md` 复制到 `~/.hermes/skills/hermes-mis.md`
 2. 在 Hermes 中说：`启用记忆优化`
 3. Hermes 会自动诊断、优化、输出结果
-
-### 方式二：命令行安装
-
-```bash
-# 复制 SKILL.md 到 Hermes skills 目录
-cp SKILL.md ~/.hermes/skills/hermes-mis.md
-
-# 或者创建目录并复制
-mkdir -p ~/.hermes/skills
-cp SKILL.md ~/.hermes/skills/hermes-mis.md
-```
-
-然后在 Hermes 中说：`启用记忆优化`
 
 ## 优化效果
 

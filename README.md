@@ -20,24 +20,25 @@ MIS (Memory-Index-Skill) splits Memory into three layers:
 
 ## Quick Start
 
-### Option 1: Manual Install
+### Option 1: One-Command Install (Recommended)
+
+Say to Hermes:
+```
+Install skill from https://github.com/FSWei/hermes-mis
+```
+
+Or use CLI:
+```bash
+hermes skills install https://github.com/FSWei/hermes-mis
+```
+
+Then say: `Enable memory optimization`
+
+### Option 2: Manual Install
 
 1. Copy `SKILL.md` to `~/.hermes/skills/hermes-mis.md`
 2. Say to Hermes: `Enable memory optimization`
 3. Hermes will automatically diagnose, optimize, and output results
-
-### Option 2: Command Line Install
-
-```bash
-# Copy SKILL.md to Hermes skills directory
-cp SKILL.md ~/.hermes/skills/hermes-mis.md
-
-# Or create directory and copy
-mkdir -p ~/.hermes/skills
-cp SKILL.md ~/.hermes/skills/hermes-mis.md
-```
-
-Then say to Hermes: `Enable memory optimization`
 
 ## Optimization Results
 
