@@ -29,16 +29,13 @@ MIS (Memory-Index-Skill) 方案把 Memory 拆成三层：
 ```
 Memory（2200 字节，100% 满）：
 ────────────────────────────────────────────────────────────────────
-distillyourself.cn — Vue3+Express+SQLite+多Provider AI 人格分析引擎。
-服务器 59.110.226.32。JWT 绕验证码方案：详见 skill distillyourself 的 
-Pitfall #40~41。MiMo JSON 解析问题见 distillyourself 的 
-references/mimo-json-parsing-issues.md。批量蒸馏：详见 skill 
-celebrity-batch-distill（JWT 绕验证码）。阿里云 RAM 策略：
-distill-captcha/mail/DNSaccess。
+my-webapp — React+Node.js+PostgreSQL 电商平台。
+服务器 10.0.1.100。JWT 认证：已实现。支付集成：Stripe API。
+数据库迁移：详见 skill my-webapp Pitfall #12。Redis 缓存产品列表...
 
-DevEnv — Spring Boot + Vue 3 + Docker Compose 开发环境。
-服务器 47.108.94.248。域名：devenv.com.cn。Nginx 反向代理，PM2 
-进程管理器...
+my-api — FastAPI+Python REST API 服务。
+服务器 10.0.1.101。端点：/users, /products, /orders。
+速率限制：100 请求/分钟。API 文档在 /docs 端点...
 
 [只能放 3-5 个项目！]
 ```
@@ -48,21 +45,19 @@ DevEnv — Spring Boot + Vue 3 + Docker Compose 开发环境。
 ```
 Memory（500 字节，23% 使用）：
 ────────────────────────────────────────────────────────────────────
-§distillyourself：详见 skill distillyourself。服务器 59.110.226.32。
-§DevEnv：详见 skill devenv。服务器 47.108.94.248。
-§个人博客：详见 skill personal-website。服务器 47.108.94.248。
-§自媒体：详见 skill self-media-video。
-§名人蒸馏：详见 skill celebrity-batch-distill。
-§Hermes配置：详见 skill hermes-agent。
-§用户身份：详见 skill fsw-identity。
-§飞书平台：详见 skill feishu-platform。
-§待办：详见 skill todo-list。
-§GitBrain：详见 skill gitbrain。
+§my-webapp：详见 skill my-webapp。服务器 10.0.1.100。
+§my-api：详见 skill my-api。服务器 10.0.1.101。
+§my-blog：详见 skill my-blog。域名 blog.example.com。
+§my-bot：详见 skill my-bot。
+§my-tools：详见 skill my-tools。
+§user-config：详见 skill user-config。
+§platform-a：详见 skill platform-a。
+§project-x：详见 skill project-x。
 
 [10+ 个项目！100+ KB 有效容量]
 ```
 
-**魔法所在：** 当 Hermes 看到 `§distillyourself：详见 skill distillyourself` 时，会自动加载完整的 Skill 文件，获取所有详情。
+**魔法所在：** 当 Hermes 看到 `§my-webapp：详见 skill my-webapp` 时，会自动加载完整的 Skill 文件，获取所有详情。
 
 ---
 
@@ -114,8 +109,8 @@ Hermes 会分析你的 Memory 内容，分类为：
 把项目详情从 Memory 迁移到 Skill，Memory 只保留索引：
 
 ```
-旧：distillyourself.cn — Vue3+Express+SQLite+多Provider AI 人格分析引擎，服务器 59.110.226.32...
-新：§distillyourself：详见 skill distillyourself。服务器 59.110.226.32。
+旧：my-webapp — React+Node.js+PostgreSQL 电商平台，服务器 10.0.1.100...
+新：§my-webapp：详见 skill my-webapp。服务器 10.0.1.100。
 ```
 
 ### 3. 创建 Skill 文件

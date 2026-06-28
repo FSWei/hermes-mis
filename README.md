@@ -29,16 +29,14 @@ MIS (Memory-Index-Skill) splits Memory into three layers:
 ```
 Memory (2200 bytes, 100% full):
 ────────────────────────────────────────────────────────────────────
-distillyourself.cn — Vue3+Express+SQLite+multi-provider AI personality 
-analysis engine. Server 59.110.226.32. JWT bypass captcha solution: see 
-skill distillyourself Pitfall #40~41. MiMo JSON parsing issues see 
-distillyourself references/mimo-json-parsing-issues.md. Batch distillation: 
-see skill celebrity-batch-distill (JWT bypass captcha). Alibaba Cloud RAM 
-strategy: distill-captcha/mail/DNSaccess.
+my-webapp — React+Node.js+PostgreSQL e-commerce platform. 
+Server 10.0.1.100. JWT authentication: implemented. Payment 
+integration: Stripe API. Database migrations: see skill my-webapp 
+Pitfall #12. Redis caching for product listings...
 
-DevEnv — Spring Boot + Vue 3 + Docker Compose development environment. 
-Server 47.108.94.248. Domain: devenv.com.cn. Nginx reverse proxy, PM2 
-process manager...
+my-api — FastAPI+Python REST API service. Server 10.0.1.101. 
+Endpoints: /users, /products, /orders. Rate limiting: 100 req/min. 
+API docs at /docs endpoint...
 
 [ONLY 3-5 PROJECTS FIT!]
 ```
@@ -48,21 +46,19 @@ process manager...
 ```
 Memory (500 bytes, 23% used):
 ────────────────────────────────────────────────────────────────────
-§distillyourself: see skill distillyourself. server 59.110.226.32.
-§DevEnv: see skill devenv. server 47.108.94.248.
-§blog: see skill personal-website. server 47.108.94.248.
-§media: see skill self-media-video.
-§celebrity: see skill celebrity-batch-distill.
-§Hermes: see skill hermes-agent.
-§identity: see skill fsw-identity.
-§Feishu: see skill feishu-platform.
-§todo: see skill todo-list.
-§GitBrain: see skill gitbrain.
+§my-webapp: see skill my-webapp. server 10.0.1.100.
+§my-api: see skill my-api. server 10.0.1.101.
+§my-blog: see skill my-blog. domain blog.example.com.
+§my-bot: see skill my-bot.
+§my-tools: see skill my-tools.
+§user-config: see skill user-config.
+§platform-a: see skill platform-a.
+§project-x: see skill project-x.
 
 [10+ PROJECTS FIT! 100+ KB EFFECTIVE CAPACITY]
 ```
 
-**The magic:** When Hermes sees `§distillyourself: see skill distillyourself`, it automatically loads the full Skill file with all details.
+**The magic:** When Hermes sees `§my-webapp: see skill my-webapp`, it automatically loads the full Skill file with all details.
 
 ---
 
@@ -114,8 +110,8 @@ Hermes analyzes your Memory content and classifies it:
 Migrate project details from Memory to Skill, Memory only keeps indexes:
 
 ```
-Before: distillyourself.cn — Vue3+Express+SQLite+multi-provider AI personality analysis engine. Server 59.110.226.32...
-After: §distillyourself: see skill distillyourself. server 59.110.226.32.
+Before: my-webapp — React+Node.js+PostgreSQL e-commerce platform. Server 10.0.1.100...
+After: §my-webapp: see skill my-webapp. server 10.0.1.100.
 ```
 
 ### 3. Create Skill Files
