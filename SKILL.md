@@ -5,245 +5,245 @@ description: "One-time memory architecture migration for Hermes. Diagnoses Memor
 
 # Hermes MIS (Memory-Index-Skill)
 
-**一次性迁移，永久生效。** 执行一次后，MIS 规则写入 SOUL.md，之后每轮自动生效。
+**One-time migration, permanent benefit.** After one execution, MIS rules are written to SOUL.md and automatically applied every turn.
 
-## 核心原理
+## Core Principle
 
 ```
-优化前：Memory 存项目详情 → 2200 字节撑满 → 3-5 个项目
-优化后：Memory 存索引 + Skill 存详情 → 500 字节 + 100KB → 10-20 个项目
+Before: Memory stores project details → 2200 bytes full → 3-5 projects
+After: Memory stores index + Skill stores details → 500 bytes + 100KB → 10-20 projects
 ```
 
-**三层架构：**
-- **Memory（索引层，~500字节）**：`§项目名：详见 skill xxx。关键常量。`
-- **Skill（存储层，~100KB）**：项目完整信息
-- **SOUL（规则层，~1KB）**：MIS 核心规则，每轮注入
+**Three-layer architecture:**
+- **Memory (Index Layer, ~500 bytes)**: `§project_name: see skill xxx. key_constants.`
+- **Skill (Storage Layer, ~100KB)**: Complete project information
+- **SOUL (Rule Layer, ~1KB)**: MIS core rules, injected every turn
 
-## 执行流程
+## Execution Flow
 
-### 第一步：诊断
+### Step 1: Diagnose
 
-**操作：**
-1. 用 `read_file` 读取 `~/.hermes/memories/MEMORY.md`
-2. 用 `read_file` 读取 `~/.hermes/soul.md`
-3. 用 `skills_list` 查看已有 Skill
+**Actions:**
+1. Use `read_file` to read `~/.hermes/memories/MEMORY.md`
+2. Use `read_file` to read `~/.hermes/soul.md`
+3. Use `skills_list` to view existing Skills
 
-**分析 Memory 内容，逐行分类：**
+**Analyze Memory content, classify line by line:**
 
-| 类型 | 判断标准 | 处理方式 |
-|------|----------|----------|
-| 索引行 | 以 `§` 开头，包含 `详见 skill` | 保留，检查对应 Skill 是否存在 |
-| 用户偏好 | < 80 字节，包含姓名/IP/语言/风格等关键词 | 保留 |
-| 项目详情 | > 80 字节，或包含技术栈/服务器/API/架构等关键词 | 迁移到 Skill |
-| 模糊内容 | 介于两者之间 | 列出，询问用户判断 |
+| Type | Criteria | Action |
+|------|----------|--------|
+| Index lines | Starts with `§`, contains `see skill` | Keep, check if corresponding Skill exists |
+| User preferences | < 80 bytes, contains name/IP/language/style keywords | Keep |
+| Project details | > 80 bytes, or contains tech stack/server/API/architecture keywords | Migrate to Skill |
+| Ambiguous content | Between the two | List, ask user to decide |
 
-**关键词判断（命中任一即归类为项目详情）：**
-- 技术类：`技术栈`、`架构`、`API`、`端点`、`数据库`、`框架`、`Vue`、`React`、`Express`、`SQLite`
-- 部署类：`服务器`、`部署`、`Nginx`、`Docker`、`SSL`、`域名`
-- 状态类：`开发中`、`已完成`、`维护中`、`Pitfalls`、`待开发`
-- 配置类：`端口`、`路径`、`配置`、`环境变量`
+**Keyword detection (any match = project details):**
+- Tech: `tech stack`, `architecture`, `API`, `endpoint`, `database`, `framework`, `Vue`, `React`, `Express`, `SQLite`
+- Deploy: `server`, `deploy`, `Nginx`, `Docker`, `SSL`, `domain`
+- Status: `in development`, `completed`, `maintaining`, `Pitfalls`, `pending`
+- Config: `port`, `path`, `config`, `environment variables`
 
-**输出诊断报告：**
+**Output diagnostic report:**
 ```
-📊 Memory 诊断
+📊 Memory Diagnostic
 
-使用量：2195/2200 字节 (99%)
-索引行：3 个（保留）
-用户偏好：2 条（保留）
-项目详情：5 条（需迁移）
-模糊内容：1 条（需确认）
+Usage: 2195/2200 bytes (99%)
+Index lines: 3 (keep)
+User preferences: 2 (keep)
+Project details: 5 (need migration)
+Ambiguous content: 1 (need confirmation)
 
-❓ "xxx：..." 这条内容是项目详情还是用户偏好？
+❓ "xxx: ..." — Is this project detail or user preference?
 
-迁移后预计：~500 字节 (23%)
-```
-
-### 第二步：优化 Memory
-
-**用 `memory` 工具的 `replace` 操作逐条替换：**
-
-**替换规则：**
-```
-旧：项目完整描述（可能 200-500 字节）
-新：§项目名：详见 skill 项目名。关键常量。（约 50 字节）
+After migration: ~500 bytes (23%)
 ```
 
-**索引行格式规范：**
-- 必须以 `§` 开头
-- 必须包含 `详见 skill xxx`
-- 可包含 1-2 个关键常量（服务器 IP、端口、状态）
-- 总长度不超过 100 字节
+### Step 2: Optimize Memory
 
-**关键常量选择优先级：**
-1. 服务器 IP/域名（最常用）
-2. 端口号
-3. 项目状态（开发中/已完成/维护中）
-4. 其他高频使用的信息
+**Use `memory` tool's `replace` operation to replace one by one:**
 
-**示例：**
+**Replacement rule:**
 ```
-§my-app：详见 skill my-app。服务器 1.2.3.4。
-§blog：详见 skill blog。域名 example.com。已完成。
-§api：详见 skill api。端口 3000。开发中。
+Old: Full project description (may be 200-500 bytes)
+New: §project_name: see skill project_name. key_constants. (~50 bytes)
 ```
 
-### 第三步：创建 Skill 文件
+**Index line format specification:**
+- Must start with `§`
+- Must contain `see skill xxx`
+- Can include 1-2 key constants (server IP, port, status)
+- Total length ≤ 100 bytes
 
-**用 `skill_manage(action='create')` 创建，自动从 Memory 内容生成：**
+**Key constants selection priority:**
+1. Server IP/domain (most frequently used)
+2. Port number
+3. Project status (in development/completed/maintaining)
+4. Other high-frequency information
 
-**description 自动生成规则：**
-- 从旧内容的第一句话提取
-- 如果包含项目类型描述，直接使用
-- 否则用"项目名 — 简短描述"格式
+**Examples:**
+```
+§my-app: see skill my-app. server 1.2.3.4.
+§blog: see skill blog. domain example.com. completed.
+§api: see skill api. port 3000. in development.
+```
 
-**Skill 内容结构：**
+### Step 3: Create Skill Files
+
+**Use `skill_manage(action='create')` to create, auto-generated from Memory content:**
+
+**Description auto-generation rules:**
+- Extract from the first sentence of old content
+- If it contains project type description, use directly
+- Otherwise use "project_name — short description" format
+
+**Skill content structure:**
 ```markdown
 ---
-name: 项目名
-description: "从 Memory 迁移的一句话描述"
+name: project_name
+description: "One-sentence description migrated from Memory"
 ---
 
-# 项目名
+# Project Name
 
-（从 Memory 迁移的完整内容，重新组织）
+(Complete content migrated from Memory, reorganized)
 
-## 基本信息
-- 项目类型：（Web应用/CLI工具/库/服务）
-- 技术栈：（从旧内容中提取）
-- 服务器：（从旧内容中提取）
-- 状态：（开发中/已完成/维护中）
+## Basic Info
+- Project Type: (Web app/CLI tool/library/service)
+- Tech Stack: (extracted from old content)
+- Server: (extracted from old content)
+- Status: (in development/completed/maintaining)
 
-## 详细信息
-（旧内容中的技术细节、架构、API 等）
+## Detailed Info
+(Technical details, architecture, API, etc. from old content)
 
 ## Pitfalls
-（旧内容中提到的问题、注意事项）
+(Problems and notes mentioned in old content)
 
-## 相关资源
-（旧内容中的链接、文档地址）
+## Related Resources
+(Links and documentation addresses from old content)
 ```
 
-**已有 Skill 的处理：**
-- 如果 Skill 已存在且内容完整 → 跳过，只更新 Memory 索引
-- 如果 Skill 存在但缺少从 Memory 迁移的内容 → 用 `skill_manage(action='patch')` 补充
-- 如果 Skill 存在但内容冲突 → 列出差异，询问用户
+**Handling existing Skills:**
+- If Skill exists and content is complete → Skip, only update Memory index
+- If Skill exists but missing migrated content → Use `skill_manage(action='patch')` to supplement
+- If Skill exists but content conflicts → List differences, ask user
 
-### 第四步：精简 SOUL.md 并注入 MIS 规则
+### Step 4: Slim SOUL.md and Inject MIS Rules
 
-**用 `read_file` 读取 SOUL.md，分析并精简：**
+**Use `read_file` to read SOUL.md, analyze and slim down:**
 
-**MIS 核心规则（必须写入）：**
+**MIS core rules (must be written):**
 ```markdown
-## 记忆管理
-Memory是索引，Skill是存储。看到"详见skill xxx"必须加载。
-项目细节写入skill，memory只写索引。
+## Memory Management
+Memory is index, Skill is storage. Must load when seeing "see skill xxx".
+Project details go to Skill, Memory only stores index.
 
-## 写入规则
-写Memory前必须先读Memory。检查已有条目再决定新增/替换/合并。
-涉及项目细节 → 写skill，memory只写索引。
+## Write Rules
+Must read Memory before writing. Check existing entries before deciding add/replace/merge.
+Project details → write to Skill, Memory only stores index.
 
-## 项目工作
-涉及项目 → 先读memory找到索引 → skill_view加载 → 再动手。
+## Project Work
+For projects → read Memory to find index → skill_view to load → then start working.
 
-## 待办管理
-用户说"帮我记一下"/"记待办"/"添加TODO" → 读取 todo-list skill → 追加待办项。
-用户说"看看待办" → 读取 todo-list skill → 展示列表。
-待办事项只存在 todo-list skill 中，不写 Memory。
+## Todo Management
+User says "remember this"/"add todo"/"add TODO" → read todo-list skill → append todo item.
+User says "show todos" → read todo-list skill → display list.
+Todo items only exist in todo-list skill, not in Memory.
 ```
 
-**保留的个性化规则（不要删除）：**
-- 包含 `详见 skill` 的引用行（指向用户自己的 Skill）
-- 平台特定规则（飞书、微信、Telegram 等输出格式）
-- 用户身份/偏好规则
-- 待办管理规则
-- 安全规则
+**Personalized rules to keep (do not delete):**
+- Lines containing `see skill` references (pointing to user's own Skills)
+- Platform-specific rules (Feishu, WeChat, Telegram output formats)
+- User identity/preference rules
+- Todo management rules
+- Security rules
 
-**可删除的内容：**
-- 同一条规则出现两次以上（保留最简洁的版本）
-- 项目详情（这些应该在 Skill 中，不应该在 SOUL 中）
-- 过时的功能规则（已不再使用的功能）
-- 过于详细的解释（SOUL 只保留触发条件，详细说明放 Skill）
+**Content to delete:**
+- Same rule appearing more than once (keep the most concise version)
+- Project details (should be in Skill, not in SOUL)
+- Outdated feature rules (no longer in use)
+- Overly detailed explanations (SOUL only keeps trigger conditions, details go to Skill)
 
-**SOUL 大小目标：**
-- 理想：800-1200 字节
-- 可接受：1200-1800 字节
-- 需精简：> 1800 字节
+**SOUL size targets:**
+- Ideal: 800-1200 bytes
+- Acceptable: 1200-1800 bytes
+- Needs slimming: > 1800 bytes
 
-### 第五步：验证
+### Step 5: Verify
 
-**逐项检查：**
+**Check each item:**
 
-1. **Memory 使用率**
-   - 目标：< 50%（约 1100 字节）
-   - 如果仍 > 70%，检查是否有遗漏的项目详情
+1. **Memory usage rate**
+   - Target: < 50% (~1100 bytes)
+   - If still > 70%, check for missed project details
 
-2. **索引完整性**
-   - 遍历 Memory 中所有 `§` 开头的行
-   - 提取 `详见 skill xxx` 中的 xxx
-   - 用 `skill_view(name=xxx)` 验证 Skill 存在
-   - 如果 Skill 不存在，创建或报告
+2. **Index integrity**
+   - Iterate all lines starting with `§` in Memory
+   - Extract xxx from `see skill xxx`
+   - Verify Skill exists with `skill_view(name=xxx)`
+   - If Skill doesn't exist, create or report
 
-3. **SOUL 规则完整性**
-   - 确认包含"记忆管理"模块
-   - 确认包含"写入规则"模块
-   - 确认包含"项目工作"模块
-   - 确认大小 < 1800 字节
+3. **SOUL rule integrity**
+   - Confirm contains "Memory Management" module
+   - Confirm contains "Write Rules" module
+   - Confirm contains "Project Work" module
+   - Confirm size < 1800 bytes
 
-4. **输出报告：**
+4. **Output report:**
 ```
-✅ MIS 迁移完成！
+✅ MIS Migration Complete!
 
-📊 优化结果：
-- Memory：2195 字节 (99%) → 480 字节 (22%)
-- Skill：创建 5 个，更新 1 个
-- SOUL：3.2KB → 1.1KB（已注入 MIS 规则）
-- 等效容量：2.2KB → 100+KB（约 50 倍扩展）
+📊 Optimization Results:
+- Memory: 2195 bytes (99%) → 480 bytes (22%)
+- Skills: 5 created, 1 updated
+- SOUL: 3.2KB → 1.1KB (MIS rules injected)
+- Effective capacity: 2.2KB → 100+KB (~50x expansion)
 
-📋 创建的 Skill：
-- my-app（Web应用）
-- my-api（后端服务）
-- my-blog（个人博客）
+📋 Created Skills:
+- my-app (Web application)
+- my-api (Backend service)
+- my-blog (Personal blog)
 ...
 
-⚠️ 注意事项：
-- MIS 规则已写入 SOUL.md，之后自动生效
-- 新增项目时，Memory 只写索引，详情写 Skill
-- 如果 Memory 再次接近上限，重新运行此优化
+⚠️ Notes:
+- MIS rules written to SOUL.md, automatically applied from now on
+- When adding new projects, Memory only stores index, details go to Skill
+- If Memory approaches limit again, re-run this optimization
 ```
 
-## 增量模式
+## Incremental Mode
 
-如果用户 Memory 已经是 MIS 格式（大部分是 `§` 索引行），但又接近上限：
+If user's Memory is already in MIS format (mostly `§` index lines), but approaching the limit again:
 
-1. 检查是否有遗漏的项目详情
-2. 检查是否有过长的索引行（> 100 字节）
-3. 检查是否有重复的索引行
-4. 只优化有问题的部分，不重复整个流程
+1. Check for missed project details
+2. Check for overly long index lines (> 100 bytes)
+3. Check for duplicate index lines
+4. Only optimize problematic parts, don't repeat the entire flow
 
-## 边界情况处理
+## Edge Case Handling
 
-**Memory 已经是 MIS 格式：**
-- 输出"已是 MIS 格式，无需优化"
-- 检查索引完整性
+**Memory already in MIS format:**
+- Output "Already in MIS format, no optimization needed"
+- Check index integrity
 
-**SOUL 已经很精简（< 1KB）：**
-- 检查是否包含 MIS 规则
-- 如果缺少，补充 MIS 规则
-- 如果已包含，跳过
+**SOUL already very slim (< 1KB):**
+- Check if it contains MIS rules
+- If missing, add MIS rules
+- If already present, skip
 
-**Skill 已存在但内容不全：**
-- 列出缺失的内容
-- 用 `skill_manage(action='patch')` 补充
+**Skill exists but content incomplete:**
+- List missing content
+- Use `skill_manage(action='patch')` to supplement
 
-**Memory 内容全是用户偏好（无项目详情）：**
-- 输出"无需优化，Memory 已是用户偏好"
-- 建议用户将项目信息添加到 Memory
+**Memory content is all user preferences (no project details):**
+- Output "No optimization needed, Memory is all user preferences"
+- Suggest user add project information to Memory
 
-## 注意事项
+## Notes
 
-1. **先确认再动手** — 诊断完成后询问用户是否继续
-2. **不要删除用户偏好** — 姓名、IP、语言、风格等留在 Memory
-3. **索引行要精炼** — 每行 ≤ 100 字节，只写项目名 + 关键常量
-4. **Skill 命名语义清晰** — 文件名即项目名
-5. **SOUL 不能太短** — 至少保留记忆管理、写入规则、项目工作
-6. **一次性迁移** — 完成后不需要再触发此 Skill
+1. **Confirm before proceeding** — Ask user to continue after diagnosis
+2. **Don't delete user preferences** — Name, IP, language, style stay in Memory
+3. **Index lines must be concise** — Each line ≤ 100 bytes, only project name + key constants
+4. **Skill naming must be semantically clear** — Filename is project name
+5. **SOUL can't be too short** — At least keep Memory Management, Write Rules, Project Work
+6. **One-time migration** — No need to trigger this Skill again after completion
