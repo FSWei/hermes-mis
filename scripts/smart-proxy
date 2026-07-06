@@ -1,0 +1,37 @@
+#!/bin/bash
+# smart-proxy — run a command with proxy ONLY if Clash is available.
+# Usage: smart-proxy <command> [args...]
+#
+# Detection: tries to connect to 127.0.0.1:7890 with a 2-second timeout.
+# If Clash is running → runs command with proxy env vars.
+# If Clash is NOT running → runs command without proxy (direct connection).
+#
+# This is safe for Hermes: when Clash is off, commands run normally.
+# When Clash is on, blocked sites (GitHub, HuggingFace, etc.) work automatically.
+#
+# Install: cp to ~/.local/bin/smart-proxy && chmod +x ~/.local/bin/smart-proxy
+
+PROXY_URL="http://127.0.0.1:7890"
+DETECT_TIMEOUT=2
+
+# No-op if no command given
+if [ $# -eq 0 ]; then
+    echo "Usage: smart-proxy <command> [args...]"
+    echo "  Runs <command> with proxy if Clash (127.0.0.1:7890) is available."
+    exit 1
+fi
+
+# Detect: is Clash listening on 7890?
+if timeout $DETECT_TIMEOUT bash -c "echo > /dev/tcp/127.0.0.1/7890" 2>/dev/null; then
+    # Clash is running — use proxy
+    exec env \
+        http_proxy="$PROXY_URL" \
+        HTTP_PROXY="$PROXY_URL" \
+        https_proxy="$PROXY_URL" \
+        HTTPS_PROXY="$PROXY_URL" \
+        no_proxy="localhost,127.0.0.1,::1,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,.aliyuncs.com,.cn,.feishu.cn,.larksuite.com,.internal" \
+        "$@"
+else
+    # Clash not running — run without proxy
+    exec "$@"
+fi
