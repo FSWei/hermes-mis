@@ -1,0 +1,7 @@
+name: mis
+version: 1.0.0
+description: "MIS (Memory-Index-Skill) — program-level memory policy enforcement. Memory stores indexes only, Skills store details."
+author: FSWei
+homepage: https://github.com/FSWei/hermes-mis
+hooks:
+  - on_memory_write

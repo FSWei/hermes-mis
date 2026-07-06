@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Hermes Agent](https://img.shields.io/badge/Hermes-Agent-blue.svg)](https://github.com/NousResearch/hermes-agent)
 
-**One-command memory optimization for Hermes Agent — 100x capacity expansion via pure configuration. No source code changes.**
+**Program-level memory policy enforcement for Hermes Agent. Memory stores indexes only, Skills store details. Zero-install, zero-dependency.**
 
 [中文文档](README.zh-CN.md)
 
@@ -18,7 +18,46 @@ MIS (Memory-Index-Skill) splits Memory into three layers:
 - **Skill (Storage Layer)**: Stores complete project content, each can be tens of thousands of bytes
 - **SOUL (Rule Layer)**: Injects MIS rules, automatically applied every turn
 
+**The difference from prompt-based approaches:** MIS enforces its policy at the **code level**. When the LLM tries to write project details to Memory, the write is **rejected** with a clear error message. This is not a suggestion — it's a program-level gate.
+
 **Result: 10 projects = 10 index lines ≈ 500 bytes, effective capacity 100+ KB, ~100x expansion.**
+
+---
+
+## 🚀 Quick Start
+
+### One-Command Install
+
+```bash
+hermes plugins install FSWei/hermes-mis
+```
+
+### Activate
+
+```bash
+hermes plugins enable mis
+```
+
+Then set MIS as your memory provider. Edit `~/.hermes/config.yaml` (or `~/.hermes/profiles/<profile>/config.yaml`):
+
+```yaml
+memory:
+  provider: mis
+```
+
+Or use the interactive setup:
+```bash
+hermes memory setup
+```
+
+### Verify
+
+```bash
+hermes memory status
+# Should show: Provider: mis
+```
+
+**That's it.** No pip install, no npm install, no external services, no API keys.
 
 ---
 
@@ -46,139 +85,151 @@ API docs at /docs endpoint...
 ```
 Memory (500 bytes, 23% used):
 ────────────────────────────────────────────────────────────────────
-§my-webapp: see skill my-webapp. server 10.0.1.100.
-§my-api: see skill my-api. server 10.0.1.101.
-§my-blog: see skill my-blog. domain blog.example.com.
-§my-bot: see skill my-bot.
-§my-tools: see skill my-tools.
-§user-config: see skill user-config.
-§platform-a: see skill platform-a.
-§project-x: see skill project-x.
+§my-webapp：详见 skill my-webapp。
+§my-api：详见 skill my-api。
+§my-blog：详见 skill my-blog。
+§my-bot：详见 skill my-bot。
+§my-tools：详见 skill my-tools。
+§user-config：详见 skill user-config。
+§platform-a：详见 skill platform-a。
+§project-x：详见 skill project-x。
 
 [10+ PROJECTS FIT! 100+ KB EFFECTIVE CAPACITY]
 ```
-
-**The magic:** When Hermes sees `§my-webapp: see skill my-webapp`, it automatically loads the full Skill file with all details.
-
----
-
-## ⚡ Quick Start
-
-### Option 1: One-Command Install (Recommended)
-
-Say to Hermes:
-```
-Install skill from https://github.com/FSWei/hermes-mis
-```
-
-Or use CLI:
-```bash
-hermes skills install https://github.com/FSWei/hermes-mis
-```
-
-Then say: `Enable memory optimization`
-
-### Option 2: Manual Install
-
-1. Copy `SKILL.md` to `~/.hermes/skills/hermes-mis.md`
-2. Say to Hermes: `Enable memory optimization`
-3. Hermes will automatically diagnose, optimize, and output results
-
----
-
-## 📊 Optimization Results
-
-| Metric | Before | After |
-|--------|--------|-------|
-| Memory Usage | 2200 bytes (100%) | ~500 bytes (23%) |
-| Effective Capacity | 2.2 KB | 100+ KB |
-| Project Support | 3-5 projects | 10-20 projects |
 
 ---
 
 ## 🔧 How It Works
 
-### 1. Diagnose Memory
-
-Hermes analyzes your Memory content and classifies it:
-- **Index lines** (keep): Starts with `§`, contains `see skill`
-- **User preferences** (keep): Name, IP, language, style, etc.
-- **Project details** (migrate): Tech stack, server, API, architecture, etc.
-
-### 2. Optimize Memory
-
-Migrate project details from Memory to Skill, Memory only keeps indexes:
+### Architecture
 
 ```
-Before: my-webapp — React+Node.js+PostgreSQL e-commerce platform. Server 10.0.1.100...
-After: §my-webapp: see skill my-webapp. server 10.0.1.100.
+Native MemoryStore (tools/memory_tool.py)
+    └── MISMemoryStore (inherits ALL storage logic)
+            └── MISProvider (MemoryProvider plugin)
+                    ├── add() → MIS policy check → super().add()
+                    ├── replace() → MIS policy check → super().replace()
+                    ├── apply_batch() → MIS policy check → super().apply_batch()
+                    └── prefetch() → scan all entries for violations each turn
 ```
 
-### 3. Create Skill Files
+**Zero reimplementation.** All storage operations (persistence, § delimiter, dedup, drift detection, file locking, threat scanning, char limits) are inherited from the native `MemoryStore`. MIS only adds validation at write entry points.
 
-Create independent Skill files for each project, containing complete technical details, architecture, Pitfalls, etc.
+### Policy Enforcement
 
-### 4. Inject MIS Rules
+| Content Type | Target | Result |
+|---|---|---|
+| `§name：详见 skill xxx` | memory | ✅ Allowed |
+| Server IPs, ports, tech stack | memory | ❌ **Rejected** |
+| API endpoints, credentials | memory | ❌ **Rejected** |
+| User preferences, env info | memory | ✅ Allowed |
+| Anything | user | ✅ Allowed |
 
-Inject MIS core rules into SOUL.md:
-- **Memory Management**: Memory is index, Skill is storage
-- **Write Rules**: Must read Memory before writing
-- **Project Work**: For projects → read Memory to find index → skill_view to load
+When a write is rejected, the LLM receives:
+```
+[MIS Policy] Content contains project details (server IP address, port number).
+Memory only accepts index lines. Store project details in a Skill instead.
 
-### 5. Verify
+Correct format:
+  memory(action='add', target='memory', content='§项目名：详见 skill skill-name。')
 
-Check Memory usage rate, index integrity, SOUL rule completeness.
+To create a Skill:
+  skill_manage(action='create', name='skill-name', content='...')
+```
+
+### Per-Turn Scanning
+
+Even if existing memory entries have violations (from before MIS was installed), the plugin scans all entries each turn via `prefetch()` and injects a warning:
+
+```
+[MIS Alert] 2 entry/entries in MEMORY.md violate MIS policy:
+  - [server IP address] 服务器 59.110.226.32，/opt/distill/...
+  - [tech stack] 技术栈：Vue 3 + Express + SQLite...
+Action required: migrate these entries to Skills...
+```
 
 ---
 
-## 📊 Competitive Analysis
+## 📦 What's Included
 
-### Agent Memory Optimization Solutions
+```
+hermes-mis/
+├── plugin/               # Hermes MemoryProvider plugin
+│   ├── plugin.yaml       # Plugin metadata
+│   └── __init__.py       # MISProvider + MISMemoryStore + policy engine
+├── SKILL.md              # Hermes Skill (migration guide + reference)
+├── README.md             # This file
+├── README.zh-CN.md       # 中文文档
+├── LICENSE
+└── .gitignore
+```
 
-| Solution | Approach | Install | Dependencies | Agent Support |
-|----------|----------|---------|--------------|---------------|
-| **MIS** | Index + Skill | `hermes skills install` | Zero | Hermes |
-| **Mem0** | API service | `pip install mem0ai` | Python + Server | Multi-agent |
-| **Letta** | Context repos | Framework | Python + Git | Custom |
-| **MemGPT** | Virtual memory | Framework | Python | Custom |
-| **Claude Memory** | Built-in | N/A | None | Claude only |
+---
 
-### Key Differentiators
+## 🔄 Migration Guide
 
-| Feature | MIS | Mem0 | Letta | MemGPT |
-|---------|-----|------|-------|--------|
-| **Zero install** | ✅ | ❌ | ❌ | ❌ |
-| **Zero dependencies** | ✅ | ❌ (Python) | ❌ (Python) | ❌ (Python) |
-| **One-command setup** | ✅ | ❌ | ❌ | ❌ |
-| **Pure config** | ✅ | ❌ | ❌ | ❌ |
-| **100x expansion** | ✅ | ~10x | ~50x | ~50x |
-| **Hermes native** | ✅ | ❌ | ❌ | ❌ |
-| **Version control** | ✅ (Skill files) | ❌ | ✅ (Git) | ❌ |
+After installing, existing memory entries may need migration:
 
-### Why MIS?
+1. **Read your memory file:**
+   ```
+   read_file(path='~/.hermes/memories/MEMORY.md')
+   # Or for profiles: ~/.hermes/profiles/<profile>/memories/MEMORY.md
+   ```
 
-1. **Zero dependencies** — No Python, Node.js, or extra servers needed
-2. **One-command setup** — Just say "Enable memory optimization"
-3. **Pure config** — No code changes, just configuration
-4. **100x expansion** — From 2.2KB to 100+KB effective capacity
-5. **Hermes native** — Deep integration with Hermes Skill/Memory/SOUL
-6. **Version control** — Skill files can be Git-tracked
+2. **For each project detail entry, create a Skill and replace:**
+   ```
+   # Create Skill with full details
+   skill_manage(action='create', name='my-project', content='full project info here...')
+   
+   # Replace Memory entry with index line
+   memory(action='replace', target='memory',
+          old_text='old project detail text',
+          content='§my-project：详见 skill my-project。')
+   ```
+
+3. **Verify:** `prefetch()` returns empty when all violations are resolved.
+
+---
+
+## ⚙️ Configuration
+
+```yaml
+# config.yaml
+memory:
+  provider: mis                    # Activate MIS
+  memory_char_limit: 2200         # Memory store char limit (default: 2200)
+  user_char_limit: 1375           # User profile char limit (default: 1375)
+```
+
+---
+
+## 🆚 Comparison
+
+| Feature | Prompt-Only MIS | **MIS Plugin** |
+|---|---|---|
+| Policy enforcement | LLM "should follow" rules | **Code-level rejection** |
+| Reliability | ~70% (LLM may ignore) | **~100% (programmatic)** |
+| Per-turn scanning | Manual (SOUL.md rule) | **Automatic (prefetch)** |
+| Installation | Edit SOUL.md manually | **`hermes plugins install`** |
+| Updates | Manual SKILL.md edits | **`hermes plugins update`** |
+| Dependencies | None | None |
+| Storage implementation | N/A (uses native) | **Inherits native MemoryStore** |
 
 ---
 
 ## ❓ FAQ
 
-**Q: Will optimization affect Hermes's normal operation?**
-A: No. MIS only changes how Memory is used, all functions remain unchanged.
+**Q: Will this break my existing memory?**
+A: No. MIS only adds validation for NEW writes. Existing entries are preserved. The `prefetch()` scan will flag old violations as warnings until you migrate them.
 
-**Q: Do I need to manually load Skills after optimization?**
-A: No. MIS rules are automatically applied. When Hermes sees `see skill xxx`, it automatically loads.
+**Q: Can I use MIS with MCP memory tools (engram, gbrain, etc.)?**
+A: Yes. MIS replaces the built-in memory tool. MCP tools are separate and work alongside it.
 
-**Q: What if Memory approaches the limit again?**
-A: Run `Enable memory optimization` again. Hermes will enter incremental mode, only optimizing problematic parts.
+**Q: What if Hermes updates break the plugin?**
+A: The plugin imports `MemoryStore` from Hermes's internal API. If Hermes restructures, the plugin will fail with a clear error message. Update the plugin or switch back to built-in: `hermes memory setup`.
 
-**Q: Can I use multiple projects simultaneously?**
-A: Yes. Each project has its own Skill, Memory only adds one index line.
+**Q: Does this affect the `user` target?**
+A: No. MIS policy only validates `target='memory'`. The `target='user'` store is unrestricted.
 
 ---
 
@@ -186,6 +237,9 @@ A: Yes. Each project has its own Skill, Memory only adds one index line.
 
 MIT
 
-## 🔗 Related Projects
+---
 
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) — AI Agent Framework
+## 🔗 Links
+
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+- [Hermes Agent Docs](https://hermes-agent.nousresearch.com/docs)
