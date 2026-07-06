@@ -95,6 +95,30 @@ _PERSONAL_PATTERNS = [
 ]
 
 
+def _extract_skill_hint(content: str) -> str:
+    """Extract a suggested skill name from blocked content.
+    
+    Tries to find a project/domain name from common patterns.
+    Returns a lowercase hyphenated name, or empty string if nothing found.
+    """
+    import re as _re
+    # Try to find a domain name: xxx.com/xxx.cn/xxx.io
+    domain = _re.search(r'(\w+(?:-\w+)*)\.(?:com|cn|io|xyz|org|net)', content)
+    if domain:
+        return domain.group(1).lower()
+    # Try to find a project name after common keywords
+    for kw in [r'项目[：:]\s*(\S+)', r'project[：:]\s*(\S+)', r'(?:服务|service)[：:]\s*(\S+)']:
+        m = _re.search(kw, content, _re.I)
+        if m:
+            return m.group(1).lower().replace(' ', '-')
+    # Try first line, first word
+    first_line = content.split('\n')[0].strip()
+    words = first_line.split()
+    if words and len(words[0]) > 2:
+        return words[0].lower().replace(' ', '-')
+    return ''
+
+
 def _check_mis_policy(content: str) -> Optional[str]:
     """Validate content against MIS policy.
     
@@ -116,14 +140,17 @@ def _check_mis_policy(content: str) -> Optional[str]:
             violations.append(label)
 
     if violations:
+        # Extract a suggested skill name from the content
+        skill_hint = _extract_skill_hint(content)
+        skill_param = f", name='{skill_hint}'" if skill_hint else ""
+        
         return (
-            f"[MIS Policy] Content contains project details ({', '.join(violations)}). "
-            f"Memory only accepts index lines. Store project details in a Skill instead.\n\n"
-            f"Correct format:\n"
-            f"  memory(action='add', target='memory', content='§项目名：详见 skill skill-name。')\n\n"
-            f"To create a Skill:\n"
-            f"  skill_manage(action='create', name='skill-name', content='...')\n\n"
-            f"Blocked content preview: {content[:100]}{'...' if len(content) > 100 else ''}"
+            f"[MIS Policy] Blocked: content contains project details ({', '.join(violations)}).\n\n"
+            f"ACTION REQUIRED — do this now, in this turn:\n"
+            f"  Step1: skill_manage(action='create'{skill_param}, content=<the blocked content>)\n"
+            f"  Step2: memory(action='add', target='memory', content='§{skill_hint or '项目名'}：详见 skill {skill_hint or 'skill-name'}。')\n\n"
+            f"Original content preserved below — pass it to skill_manage:\n"
+            f"---\n{content}\n---"
         )
 
     return None
