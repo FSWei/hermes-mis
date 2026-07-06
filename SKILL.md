@@ -1,249 +1,152 @@
 ---
 name: hermes-mis
-description: "One-time memory architecture migration for Hermes. Diagnoses Memory usage, migrates project details to Skills, creates index lines, slims SOUL.md, and injects MIS rules that persist permanently via SOUL. Run once, benefit forever."
+description: "MIS (Memory-Index-Skill) — Hermes memory provider plugin with program-level enforcement. Memory stores indexes only, Skills store details. Zero-install, zero-dependency."
+triggers:
+  - 记忆扩展
+  - memory扩展
+  - 无限记忆
+  - memory index skill
+  - MIS
+  - hermes-mis
+  - memory优化
+  - memory policy
 ---
 
 # Hermes MIS (Memory-Index-Skill)
 
-**One-time migration, permanent benefit.** After one execution, MIS rules are written to SOUL.md and automatically applied every turn.
+**Program-level memory policy enforcement for Hermes.**
 
-## Core Principle
+Memory stores INDEXES ONLY. Skills store full details. Policy enforced at code level, not prompt level.
+
+## Installation (Plugin — Recommended)
+
+```bash
+# One-command install
+hermes plugins install FSWei/hermes-mis
+
+# Activate
+hermes plugins enable mis
+```
+
+Then edit `~/.hermes/config.yaml`:
+```yaml
+memory:
+  provider: mis
+```
+
+Or use the interactive setup:
+```bash
+hermes memory setup
+```
+
+**Verify:**
+```bash
+hermes memory status
+# Should show: Provider: mis
+```
+
+## How It Works
+
+### Architecture
 
 ```
-Before: Memory stores project details → 2200 bytes full → 3-5 projects
-After: Memory stores index + Skill stores details → 500 bytes + 100KB → 10-20 projects
+Native MemoryStore (tools/memory_tool.py)
+    └── MISMemoryStore (inherits ALL storage logic)
+            └── MISProvider (MemoryProvider plugin)
+                    ├── add() → MIS policy check → super().add()
+                    ├── replace() → MIS policy check → super().replace()
+                    ├── apply_batch() → MIS policy check → super().apply_batch()
+                    └── prefetch() → scan all entries for violations each turn
 ```
 
-**Three-layer architecture:**
-- **Memory (Index Layer, ~500 bytes)**: `§project_name: see skill xxx. key_constants.`
-- **Skill (Storage Layer, ~100KB)**: Complete project information
-- **SOUL (Rule Layer, ~1KB)**: MIS core rules, injected every turn
+**Zero reimplementation.** All storage (persistence, § delimiter, dedup, drift detection, file locking, threat scanning, char limits) is inherited from the native MemoryStore. MIS only adds validation at write entry points.
 
-## Execution Flow
+### Policy Rules
+
+| Content Type | Target | Action |
+|---|---|---|
+| `§name：详见 skill xxx` | memory | ✅ Allowed (index line) |
+| Server IPs, ports, tech stack | memory | ❌ **Rejected** |
+| API endpoints, credentials | memory | ❌ **Rejected** |
+| User preferences, env info | memory | ✅ Allowed |
+| Anything | user | ✅ Allowed (no MIS check) |
+
+### What Happens When Policy Is Violated
+
+1. **Write-time enforcement**: LLM calls `memory(action='add', content='服务器 10.0.1.1')` → **rejected** with clear error message telling it to use a Skill instead.
+
+2. **Per-turn scanning**: `prefetch()` scans all memory entries each turn. If existing violations are found, a warning is injected into context every turn until fixed.
+
+3. **Session-end logging**: Violations are logged at session end for observability.
+
+## Migration (First-Time Setup)
+
+After installing the plugin, existing memory entries may contain project details that should be in Skills. Run the migration:
 
 ### Step 1: Diagnose
 
-**Actions:**
-1. Use `read_file` to read `~/.hermes/memories/MEMORY.md`
-2. Use `read_file` to read `~/.hermes/soul.md`
-3. Use `skills_list` to view existing Skills
+1. Read `~/.hermes/memories/MEMORY.md` (or `~/.hermes/profiles/<profile>/memories/MEMORY.md`)
+2. Identify entries with project details (IPs, tech stack, API endpoints, etc.)
+3. List existing Skills with `skills_list`
 
-**Analyze Memory content, classify line by line:**
+### Step 2: Migrate
 
-| Type | Criteria | Action |
-|------|----------|--------|
-| Index lines | Starts with `§`, contains `see skill` | Keep, check if corresponding Skill exists |
-| User preferences | < 80 bytes, contains name/IP/language/style keywords | Keep |
-| Project details | > 80 bytes, or contains tech stack/server/API/architecture keywords | Migrate to Skill |
-| Ambiguous content | Between the two | List, ask user to decide |
+For each project detail entry in Memory:
 
-**Keyword detection (any match = project details):**
-- Tech: `tech stack`, `architecture`, `API`, `endpoint`, `database`, `framework`, `Vue`, `React`, `Express`, `SQLite`
-- Deploy: `server`, `deploy`, `Nginx`, `Docker`, `SSL`, `domain`
-- Status: `in development`, `completed`, `maintaining`, `Pitfalls`, `pending`
-- Config: `port`, `path`, `config`, `environment variables`
+1. **Create a Skill:**
+   ```
+   skill_manage(action='create', name='project-name', content='full project details here')
+   ```
 
-**Output diagnostic report:**
-```
-📊 Memory Diagnostic
+2. **Replace Memory entry with index line:**
+   ```
+   memory(action='replace', target='memory',
+          old_text='the old project detail entry',
+          content='§project-name：详见 skill project-name。关键常量。')
+   ```
 
-Usage: 2195/2200 bytes (99%)
-Index lines: 3 (keep)
-User preferences: 2 (keep)
-Project details: 5 (need migration)
-Ambiguous content: 1 (need confirmation)
+### Step 3: Verify
 
-❓ "xxx: ..." — Is this project detail or user preference?
+After migration, `prefetch()` should return empty (no violations). The plugin will warn you each turn about any remaining violations.
 
-After migration: ~500 bytes (23%)
-```
+## Key Constants
 
-### Step 2: Optimize Memory
-
-**Use `memory` tool's `replace` operation to replace one by one:**
-
-**Replacement rule:**
-```
-Old: Full project description (may be 200-500 bytes)
-New: §project_name: see skill project_name. key_constants. (~50 bytes)
-```
-
-**Index line format specification:**
-- Must start with `§`
-- Must contain `see skill xxx`
-- Can include 1-2 key constants (server IP, port, status)
-- Total length ≤ 100 bytes
-
-**Key constants selection priority:**
-1. Server IP/domain (most frequently used)
-2. Port number
-3. Project status (in development/completed/maintaining)
-4. Other high-frequency information
-
-**Examples:**
-```
-§my-app: see skill my-app. server 1.2.3.4.
-§blog: see skill blog. domain example.com. completed.
-§api: see skill api. port 3000. in development.
-```
-
-### Step 3: Create Skill Files
-
-**Use `skill_manage(action='create')` to create, auto-generated from Memory content:**
-
-**Description auto-generation rules:**
-- Extract from the first sentence of old content
-- If it contains project type description, use directly
-- Otherwise use "project_name — short description" format
-
-**Skill content structure:**
-```markdown
----
-name: project_name
-description: "One-sentence description migrated from Memory"
----
-
-# Project Name
-
-(Complete content migrated from Memory, reorganized)
-
-## Basic Info
-- Project Type: (Web app/CLI tool/library/service)
-- Tech Stack: (extracted from old content)
-- Server: (extracted from old content)
-- Status: (in development/completed/maintaining)
-
-## Detailed Info
-(Technical details, architecture, API, etc. from old content)
+- Memory char limit: 2200 (configurable via `memory.memory_char_limit`)
+- User char limit: 1375 (configurable via `memory.user_char_limit`)
+- Entry delimiter: `§` (newline-section sign-newline)
 
 ## Pitfalls
-(Problems and notes mentioned in old content)
 
-## Related Resources
-(Links and documentation addresses from old content)
+### Pitfall #1: Import Path Is Internal API
+`from tools.memory_tool import MemoryStore` is not a public API. If Hermes restructures, the plugin fails with a clear error message. This is acceptable — the plugin tracks Hermes versions.
+
+### Pitfall #2: Only One Memory Provider at a Time
+Setting `memory.provider: mis` disables the native memory tool entirely. MIS handles ALL memory operations (add/replace/remove for both `memory` and `user` targets).
+
+### Pitfall #3: Plugin Directory Location
+User-installed plugins go to `$HERMES_HOME/plugins/`, which is profile-scoped:
+- Default: `~/.hermes/plugins/`
+- Profile "chips": `~/.hermes/profiles/chips/plugins/`
+- Use `hermes memory status` to verify the plugin is discovered.
+
+### Pitfall #4: User Target Bypasses MIS Check
+MIS policy only validates `target='memory'`. The `target='user'` store (user profile) is unrestricted — user preferences, personal details, etc. go there freely.
+
+## Uninstallation
+
+```bash
+# Remove plugin
+rm -rf $HERMES_HOME/plugins/mis
+
+# Or if installed via hermes plugins:
+hermes plugins remove mis
+
+# Revert to built-in memory
+# Edit config.yaml: remove memory.provider or set to builtin
 ```
 
-**Handling existing Skills:**
-- If Skill exists and content is complete → Skip, only update Memory index
-- If Skill exists but missing migrated content → Use `skill_manage(action='patch')` to supplement
-- If Skill exists but content conflicts → List differences, ask user
+## References
 
-### Step 4: Slim SOUL.md and Inject MIS Rules
-
-**Use `read_file` to read SOUL.md, analyze and slim down:**
-
-**MIS core rules (must be written):**
-```markdown
-## Memory Management
-Memory is index, Skill is storage. Must load when seeing "see skill xxx".
-Project details go to Skill, Memory only stores index.
-
-## Write Rules
-Must read Memory before writing. Check existing entries before deciding add/replace/merge.
-Project details → write to Skill, Memory only stores index.
-
-## Project Work
-For projects → read Memory to find index → skill_view to load → then start working.
-
-## Todo Management
-User says "remember this"/"add todo"/"add TODO" → read todo-list skill → append todo item.
-User says "show todos" → read todo-list skill → display list.
-Todo items only exist in todo-list skill, not in Memory.
-```
-
-**Personalized rules to keep (do not delete):**
-- Lines containing `see skill` references (pointing to user's own Skills)
-- Platform-specific rules (Feishu, WeChat, Telegram output formats)
-- User identity/preference rules
-- Todo management rules
-- Security rules
-
-**Content to delete:**
-- Same rule appearing more than once (keep the most concise version)
-- Project details (should be in Skill, not in SOUL)
-- Outdated feature rules (no longer in use)
-- Overly detailed explanations (SOUL only keeps trigger conditions, details go to Skill)
-
-**SOUL size targets:**
-- Ideal: 800-1200 bytes
-- Acceptable: 1200-1800 bytes
-- Needs slimming: > 1800 bytes
-
-### Step 5: Verify
-
-**Check each item:**
-
-1. **Memory usage rate**
-   - Target: < 50% (~1100 bytes)
-   - If still > 70%, check for missed project details
-
-2. **Index integrity**
-   - Iterate all lines starting with `§` in Memory
-   - Extract xxx from `see skill xxx`
-   - Verify Skill exists with `skill_view(name=xxx)`
-   - If Skill doesn't exist, create or report
-
-3. **SOUL rule integrity**
-   - Confirm contains "Memory Management" module
-   - Confirm contains "Write Rules" module
-   - Confirm contains "Project Work" module
-   - Confirm size < 1800 bytes
-
-4. **Output report:**
-```
-✅ MIS Migration Complete!
-
-📊 Optimization Results:
-- Memory: 2195 bytes (99%) → 480 bytes (22%)
-- Skills: 5 created, 1 updated
-- SOUL: 3.2KB → 1.1KB (MIS rules injected)
-- Effective capacity: 2.2KB → 100+KB (~50x expansion)
-
-📋 Created Skills:
-- my-app (Web application)
-- my-api (Backend service)
-- my-blog (Personal blog)
-...
-
-⚠️ Notes:
-- MIS rules written to SOUL.md, automatically applied from now on
-- When adding new projects, Memory only stores index, details go to Skill
-- If Memory approaches limit again, re-run this optimization
-```
-
-## Incremental Mode
-
-If user's Memory is already in MIS format (mostly `§` index lines), but approaching the limit again:
-
-1. Check for missed project details
-2. Check for overly long index lines (> 100 bytes)
-3. Check for duplicate index lines
-4. Only optimize problematic parts, don't repeat the entire flow
-
-## Edge Case Handling
-
-**Memory already in MIS format:**
-- Output "Already in MIS format, no optimization needed"
-- Check index integrity
-
-**SOUL already very slim (< 1KB):**
-- Check if it contains MIS rules
-- If missing, add MIS rules
-- If already present, skip
-
-**Skill exists but content incomplete:**
-- List missing content
-- Use `skill_manage(action='patch')` to supplement
-
-**Memory content is all user preferences (no project details):**
-- Output "No optimization needed, Memory is all user preferences"
-- Suggest user add project information to Memory
-
-## Notes
-
-1. **Confirm before proceeding** — Ask user to continue after diagnosis
-2. **Don't delete user preferences** — Name, IP, language, style stay in Memory
-3. **Index lines must be concise** — Each line ≤ 100 bytes, only project name + key constants
-4. **Skill naming must be semantically clear** — Filename is project name
-5. **SOUL can't be too short** — At least keep Memory Management, Write Rules, Project Work
-6. **One-time migration** — No need to trigger this Skill again after completion
+- GitHub: https://github.com/FSWei/hermes-mis
+- Hermes MemoryProvider docs: `agent/memory_provider.py`
+- Native MemoryStore: `tools/memory_tool.py`
