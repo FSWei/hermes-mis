@@ -1,7 +1,5 @@
 name: mis
-version: 1.0.0
-description: "MIS (Memory-Index-Skill) — program-level memory policy enforcement. Memory stores indexes only, Skills store details."
+version: 2.0.0
+description: "MIS Memory Engine v2 — two-layer memory management with auto-archival, cross-layer search, access tracking, and write-failure recovery."
 author: FSWei
 homepage: https://github.com/FSWei/hermes-mis
-hooks:
-  - on_memory_write

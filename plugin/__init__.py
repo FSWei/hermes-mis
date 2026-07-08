@@ -1,15 +1,16 @@
-"""MIS (Memory-Index-Skill) — MemoryProvider plugin for Hermes.
+"""MIS (Memory-Index-Skill) — Memory Engine v2 for Hermes.
 
-Program-level enforcement of the MIS memory strategy:
-  - Memory stores INDEXES ONLY (§name: see skill xxx)
-  - Skills store full project details
-  - Writes that violate policy are rejected at code level, not prompt level
+Program-level memory management:
+  - MEMORY.md: active layer (short indexes, always in context)
+  - memory-archive skill: archive layer (auto-archived entries)
+  - Write validation, auto-archival, cross-layer search, access tracking
+  - Per-session state for gateway concurrency safety
+  - All hard constraints at code level, not prompt level
 
 Architecture:
   MISMemoryStore subclasses the native MemoryStore from tools.memory_tool.
-  All storage logic (persistence, § delimiter, dedup, drift detection, file
-  locking, threat scanning) is inherited unchanged. MIS only adds validation
-  at add() and replace() entry points.
+  MISProvider implements the MemoryProvider ABC with all available hooks.
+  Tool schema extends the native memory tool with search/promote/status/archive.
 
 Installation:
   hermes plugins install FSWei/hermes-mis
@@ -22,6 +23,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
+import threading
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -29,7 +34,7 @@ from agent.memory_provider import MemoryProvider
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Defensive import of MemoryStore — if Hermes restructures, fail loud.
+# Defensive import of MemoryStore
 # ---------------------------------------------------------------------------
 
 try:
@@ -37,7 +42,6 @@ try:
 except ImportError:
     raise RuntimeError(
         "MIS plugin requires Hermes's MemoryStore (tools.memory_tool). "
-        "This version of Hermes may have restructured its memory system. "
         "Update the MIS plugin or switch to the built-in memory provider: "
         "hermes memory provider builtin"
     )
@@ -51,172 +55,450 @@ except ImportError:
         return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 
 # ---------------------------------------------------------------------------
-# MIS Policy Engine
+# MIS Policy Engine (unchanged core, enhanced edge cases)
 # ---------------------------------------------------------------------------
 
-# Index line format: §name：see skill xxx (Chinese or English colon)
 _INDEX_LINE_RE = re.compile(
-    r'^\s*§\s*.+\S\s*[：:]\s*(?:详见|see)\s+skill\s+\S+',
+    r'^\s*§\s*.+\S\s*[：:]?\s*(?:详见|see)\s+(?:skill|gbrain\s+page)\s+\S+',
     re.IGNORECASE,
 )
 
-# Project detail signal patterns — if content matches any of these,
-# it belongs in a Skill, not in Memory.
-_PROJECT_DETAIL_PATTERNS = [
-    (re.compile(r'(?:服务器|server)\s*(?:IP)?\s*[：:]?\s*\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', re.I),
-     "server IP address"),
-    (re.compile(r'(?:技术栈|tech\s*stack)\s*[：:]', re.I),
-     "tech stack details"),
-    (re.compile(r'(?:架构|architecture)\s*[：:]\s*\S', re.I),
-     "architecture details"),
-    (re.compile(r'(?:数据库|database|DB)\s*[：:]\s*\S', re.I),
-     "database details"),
-    (re.compile(r'(?:部署|deploy)\s*[：:]\s*\S', re.I),
-     "deployment details"),
-    (re.compile(r'(?:API|端点|endpoint)\s*[：:]\s*\S', re.I),
-     "API endpoint"),
-    (re.compile(r'(?:端口|port)\s*[：:]?\s*\d{2,5}', re.I),
-     "port number"),
-    (re.compile(r'(?:密码|password|token|secret|api.?key)\s*[：:]\s*\S', re.I),
-     "credential/secret"),
-    (re.compile(r'(?:表结构|schema|字段|column)\s*[：:]', re.I),
-     "database schema"),
-    (re.compile(r'(?:路由|route)\s*[：:]\s*/\S', re.I),
-     "API route"),
-    (re.compile(r'(?:组件|component)\s*[：:]\s*\S{10,}', re.I),
-     "component details"),
-]
+_DEFAULT_MAX_MEMORY_ENTRY_LENGTH = 150
 
-# Content that's clearly personal/environment info — always allowed
 _PERSONAL_PATTERNS = [
     re.compile(r'(?:偏好|prefer)', re.I),
     re.compile(r'(?:用户名?|user\s*name)\s*[：:]', re.I),
     re.compile(r'(?:操作系统|OS)\s*[：:]', re.I),
 ]
 
+_REFERENCE_CONTENT_PATTERNS = [
+    (re.compile(r'(?:^|\n)\s*[-•·]\s+', re.M), "bullet list"),
+    (re.compile(r'(?:^|\n)\s*\d+[.)、]\s+', re.M), "numbered list"),
+    (re.compile(r'→|=>|：.*→'), "arrow/chain notation"),
+    (re.compile(r'(?:步骤|step)\s*\d', re.I), "step-by-step"),
+    (re.compile(r'(?:首先|然后|接着|最后|其次)'), "sequential flow"),
+    (re.compile(r'(?:第[一二三四五六七八九十]+步)'), "numbered steps"),
+    (re.compile(r'\|.*\|.*\|'), "table structure"),
+    (re.compile(r'(?:详见|参考|see)\s+(?!skill\s|gbrain\s+page)'), "references non-skill"),
+]
 
-def _extract_skill_hint(content: str) -> str:
-    """Extract a suggested skill name from blocked content.
-    
-    Tries to find a project/domain name from common patterns.
-    Returns a lowercase hyphenated name, or empty string if nothing found.
-    """
-    import re as _re
-    # Try to find a domain name: xxx.com/xxx.cn/xxx.io
-    domain = _re.search(r'(\w+(?:-\w+)*)\.(?:com|cn|io|xyz|org|net)', content)
-    if domain:
-        return domain.group(1).lower()
-    # Try to find a project name after common keywords
-    for kw in [r'项目[：:]\s*(\S+)', r'project[：:]\s*(\S+)', r'(?:服务|service)[：:]\s*(\S+)']:
-        m = _re.search(kw, content, _re.I)
-        if m:
-            return m.group(1).lower().replace(' ', '-')
-    # Try first line, first word
-    first_line = content.split('\n')[0].strip()
-    words = first_line.split()
-    if words and len(words[0]) > 2:
-        return words[0].lower().replace(' ', '-')
-    return ''
+_DOMAIN_DETAIL_PATTERNS = [
+    (re.compile(r'(?:服务器|server)\s*(?:IP)?\s*[：:]?\s*\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', re.I), "server IP"),
+    (re.compile(r'(?:技术栈|tech\s*stack)\s*[：:]', re.I), "tech stack"),
+    (re.compile(r'(?:架构|architecture)\s*[：:]\\s*\\S', re.I), "architecture"),
+    (re.compile(r'(?:数据库|database|DB)\s*[：:]\\s*\\S', re.I), "database"),
+    (re.compile(r'(?:部署|deploy)\s*[：:]\\s*\\S', re.I), "deployment"),
+    (re.compile(r'(?:API|端点|endpoint)\s*[：:]\\s*\\S', re.I), "API endpoint"),
+    (re.compile(r'(?:端口|port)\s*[：:]?\s*\d{2,5}', re.I), "port number"),
+    (re.compile(r'(?:密码|password|token|secret|api.?key)\s*[：:]\\s*\\S', re.I), "credential"),
+    (re.compile(r'(?:表结构|schema|字段|column)\s*[：:]', re.I), "database schema"),
+    (re.compile(r'(?:路由|route)\s*[：:]\\s*/\\S', re.I), "API route"),
+    (re.compile(r'(?:组件|component)\s*[：:]\\s*\\S{10,}', re.I), "component details"),
+    (re.compile(r'(?:脚本|口播|文案|剧本|解说词)[^：:\n]*[：:]', re.I), "content creation"),
+    (re.compile(r'(?:封面|排版|设计风格|配色|色调)[^：:\n]*[：:]', re.I), "design spec"),
+    (re.compile(r'(?:视频|剪辑|字幕|配音|特效)[^：:\n]*[：:]', re.I), "video production"),
+    (re.compile(r'(?:推广|营销|获客|转化|漏斗)[^：:\n]*[：:]', re.I), "marketing"),
+    (re.compile(r'(?:简历|resume|工作经历|教育背景)[^：:\n]*[：:]', re.I), "resume"),
+]
+
+_PROJECT_DETAIL_PATTERNS = _DOMAIN_DETAIL_PATTERNS
 
 
-def _check_mis_policy(content: str) -> Optional[str]:
-    """Validate content against MIS policy.
-    
-    Returns None if content is allowed.
-    Returns an error message string if content violates policy.
-    """
+def _get_max_entry_length() -> int:
+    try:
+        from hermes_cli.config import load_config
+        config = load_config() or {}
+        mem_cfg = config.get("memory", {}) or {}
+        return int(mem_cfg.get("max_entry_length", _DEFAULT_MAX_MEMORY_ENTRY_LENGTH))
+    except Exception:
+        return _DEFAULT_MAX_MEMORY_ENTRY_LENGTH
+
+
+def _check_reference_structure(content: str) -> Optional[str]:
+    for pattern, label in _REFERENCE_CONTENT_PATTERNS:
+        if pattern.search(content):
+            return label
+    return None
+
+
+def _check_mis_policy(content: str, store=None) -> Optional[str]:
+    """Validate content against MIS policy. Enhanced v2 with gray zone."""
     content = content.strip()
     if not content:
         return None
 
-    # Index line format → always allowed
+    # Index line format → always allowed (check dead refs separately)
     if _INDEX_LINE_RE.match(content):
+        dead = _find_dead_references(content)
+        if dead:
+            return (
+                f"[MIS] References non-existent skill(s): {', '.join(dead)}.\n"
+                f"Create the skill first, or remove the reference."
+            )
         return None
 
-    # Check for project detail signals
+    # Short entries (<50 chars) → always allowed
+    is_short = len(content) < 50
+    if is_short:
+        return None
+
+    # Check for reference structure
+    struct_label = _check_reference_structure(content)
+    if struct_label:
+        if len(content) <= 50 and 'list' not in struct_label:
+            pass
+        else:
+            return (
+                f"[MIS] Structured content ({struct_label}) belongs in a Skill.\n"
+                f"Shorten to one line, or: skill_manage(action='create', ...)\n"
+                f"Preview: {content[:80]}{'...' if len(content) > 80 else ''}"
+            )
+
+    # Multi-point heuristic
+    segments = re.split(r'[、，,；;]\s*', content)
+    detail_segments = [s for s in segments if len(s) > 2]
+    if len(detail_segments) >= 3 and len(content) > 100:
+        return (
+            f"[MIS] {len(detail_segments)} detail points in {len(content)} chars.\n"
+            f"Shorten to one line, or create a Skill."
+        )
+
+    # Domain-specific detail signals
     violations = []
     for pattern, label in _PROJECT_DETAIL_PATTERNS:
         if pattern.search(content):
             violations.append(label)
-
-    if violations:
-        # Extract a suggested skill name from the content
-        skill_hint = _extract_skill_hint(content)
-        skill_param = f", name='{skill_hint}'" if skill_hint else ""
-        
+    if violations and len(content) > 100:
         return (
-            f"[MIS Policy] Blocked: content contains project details ({', '.join(violations)}).\n\n"
-            f"ACTION REQUIRED — do this now, in this turn:\n"
-            f"  Step1: skill_manage(action='create'{skill_param}, content=<the blocked content>)\n"
-            f"  Step2: memory(action='add', target='memory', content='§{skill_hint or '项目名'}：详见 skill {skill_hint or 'skill-name'}。')\n\n"
-            f"Original content preserved below — pass it to skill_manage:\n"
-            f"---\n{content}\n---"
+            f"[MIS] Contains project details ({', '.join(violations[:3])}).\n"
+            f"Store in a Skill, not Memory."
         )
+
+    # Length check — v2: gray zone 150-200 is allowed with suggestion
+    max_len = _get_max_entry_length()
+    if len(content) > 200:
+        return (
+            f"[MIS] Too long ({len(content)} chars > 200).\n"
+            f"Options: shorten to ≤150, create a Skill, or it will auto-archive."
+        )
+    if len(content) > max_len:
+        struct = _check_reference_structure(content)
+        if struct:
+            return (
+                f"[MIS] Long ({len(content)} chars) + structured ({struct}).\n"
+                f"Create a Skill instead."
+            )
+        # Gray zone 150-200: allowed, no rejection
 
     return None
 
 
+def _find_dead_references(content: str) -> List[str]:
+    """Check if referenced skills exist."""
+    try:
+        skills_dir = get_hermes_home() / "skills"
+        dead = []
+        for match in re.finditer(r'(?:详见|see)\s+skill\s+[`]?([\w-]+)', content, re.I):
+            skill_name = match.group(1)
+            if not (skills_dir / skill_name).exists():
+                dead.append(skill_name)
+        return dead
+    except Exception:
+        return []
+
+
 def scan_memory_violations(entries: List[str]) -> List[Dict[str, str]]:
-    """Scan all memory entries and return violations.
-    
-    Returns a list of dicts with 'entry' and 'reason' keys.
-    """
     violations = []
+    max_len = _get_max_entry_length()
     for entry in entries:
         entry = entry.strip()
         if not entry:
             continue
-        # Index lines are fine
         if _INDEX_LINE_RE.match(entry):
             continue
-        # Check for project detail signals
+        found = False
         for pattern, label in _PROJECT_DETAIL_PATTERNS:
             if pattern.search(entry):
-                violations.append({
-                    "entry": entry[:120] + ("..." if len(entry) > 120 else ""),
-                    "reason": label,
-                })
-                break  # one violation per entry is enough
+                violations.append({"entry": entry[:120], "reason": label})
+                found = True
+                break
+        if found:
+            continue
+        if len(entry) > 200:
+            violations.append({"entry": entry[:120], "reason": f"too long ({len(entry)} chars)"})
+            continue
+        struct_label = _check_reference_structure(entry)
+        if struct_label:
+            violations.append({"entry": entry[:120], "reason": struct_label})
     return violations
 
 
 # ---------------------------------------------------------------------------
-# MIS MemoryStore — inherits ALL native behavior, adds policy validation
+# Priority Classification (NEW)
+# ---------------------------------------------------------------------------
+
+_P0_KEYWORDS = {"偏好", "讨厌", "隐私极强", "用户期望", "称呼不要", "绝不"}
+_P3_KEYWORDS = {"告警缓存", "已加入备份", "临时", "Cron jobs"}
+
+_ARCHIVE_DIR_NAME = "memory-archive"
+
+
+def _classify_priority(entry: str) -> str:
+    """Pattern-based priority classification. Pure code, no LLM."""
+    entry = entry.strip()
+    if any(kw in entry for kw in _P0_KEYWORDS):
+        return "P0"
+    if any(kw in entry for kw in _P3_KEYWORDS):
+        return "P3"
+    if _INDEX_LINE_RE.match(entry):
+        return "P2"
+    return "P1"
+
+
+def _priority_rank(entry: str) -> int:
+    return {"P0": 0, "P1": 1, "P2": 2, "P3": 3}[_classify_priority(entry)]
+
+
+def _extract_keywords(entry: str) -> List[str]:
+    """Extract meaningful keywords from a memory entry for access tracking."""
+    # Remove § prefix and common format words
+    cleaned = re.sub(r'^§\s*', '', entry)
+    cleaned = re.sub(r'(?:详见|see|skill|gbrain|page|references?/)', '', cleaned, flags=re.I)
+    cleaned = re.sub(r'[：:、，,`"\'\(\)]', ' ', cleaned)
+    # Split and filter
+    words = [w.strip() for w in cleaned.split() if len(w.strip()) > 2]
+    return words[:10]  # limit to avoid noise
+
+
+# ---------------------------------------------------------------------------
+# Per-Session State Management (NEW — concurrency safe)
+# ---------------------------------------------------------------------------
+
+class _SessionState:
+    """Per-session mutable state for gateway concurrency safety."""
+    __slots__ = (
+        "pending_write_failure", "access_log", "potential_memory",
+        "current_turn", "eviction_warning_sent", "session_id",
+    )
+
+    def __init__(self, session_id: str = ""):
+        self.session_id = session_id
+        self.pending_write_failure: Optional[Dict] = None
+        self.access_log: Dict[str, Dict] = {}  # entry → {last_seen, count}
+        self.potential_memory: Optional[Dict] = None
+        self.current_turn: int = 0
+        self.eviction_warning_sent: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Archive Management (NEW)
+# ---------------------------------------------------------------------------
+
+class _ArchiveManager:
+    """Manages the memory-archive skill (Layer 2)."""
+
+    def __init__(self):
+        self._archive_dir: Optional[Path] = None
+        self._archive_file: Optional[Path] = None
+
+    @property
+    def archive_dir(self) -> Path:
+        if self._archive_dir is None:
+            self._archive_dir = get_hermes_home() / "skills" / _ARCHIVE_DIR_NAME
+        return self._archive_dir
+
+    @property
+    def archive_file(self) -> Path:
+        if self._archive_file is None:
+            self._archive_file = self.archive_dir / "references" / "archived-entries.md"
+        return self._archive_file
+
+    def exists(self) -> bool:
+        return self.archive_dir.exists() and self.archive_file.exists()
+
+    def ensure_structure(self):
+        """Create archive skill structure if it doesn't exist."""
+        if self.exists():
+            return
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        (self.archive_dir / "references").mkdir(exist_ok=True)
+
+        skill_md = (
+            "---\n"
+            "name: memory-archive\n"
+            "description: >\n"
+            "  Deprecated memory entries auto-archived by MIS.\n"
+            "  Use memory(action='search', keyword='...') to find entries.\n"
+            "  Use memory(action='promote', old_text='...') to restore.\n"
+            "tags: [memory, archive, mis]\n"
+            "---\n\n"
+            "# Memory Archive\n\n"
+            "> Auto-managed by MIS plugin. Do not edit directly.\n\n"
+            "## Operations\n\n"
+            "- `memory(action='search', keyword='xxx')` — search both layers\n"
+            "- `memory(action='promote', old_text='xxx')` — restore to MEMORY.md\n"
+            "- `memory(action='status')` — view memory stats\n"
+            "- `memory(action='archive', old_text='xxx')` — manually archive\n\n"
+            "## Content\n\n"
+            "See `references/archived-entries.md`\n"
+        )
+        (self.archive_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+        self.archive_file.write_text(
+            "# Archived Memory Entries\n\n", encoding="utf-8"
+        )
+
+    def append_entry(self, entry: str) -> bool:
+        """Append an entry to the archive file with timestamp."""
+        try:
+            self.ensure_structure()
+            existing = self.archive_file.read_text(encoding="utf-8") if self.archive_file.exists() else ""
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            new_entry = f"\n[{timestamp}] {entry}\n"
+            self.archive_file.write_text(existing + new_entry, encoding="utf-8")
+
+            # Check size limit (50KB)
+            self._check_size()
+            return True
+        except Exception as e:
+            logger.error("MIS: archive append failed: %s", e)
+            return False
+
+    def read_entries(self) -> List[str]:
+        """Read all entries from the archive file."""
+        try:
+            if not self.archive_file.exists():
+                return []
+            content = self.archive_file.read_text(encoding="utf-8")
+            entries = []
+            for line in content.split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and not line.startswith(">"):
+                    entries.append(line)
+            return entries
+        except Exception:
+            return []
+
+    def remove_entry(self, entry: str) -> bool:
+        """Remove a specific entry from the archive."""
+        try:
+            if not self.archive_file.exists():
+                return False
+            content = self.archive_file.read_text(encoding="utf-8")
+            # Find and remove the line containing the entry
+            lines = content.split("\n")
+            new_lines = []
+            removed = False
+            for line in lines:
+                if not removed and entry.strip() in line and line.strip().startswith("["):
+                    removed = True
+                    continue
+                new_lines.append(line)
+            if removed:
+                self.archive_file.write_text("\n".join(new_lines), encoding="utf-8")
+            return removed
+        except Exception:
+            return False
+
+    def count_entries(self) -> int:
+        """Count entries in archive."""
+        return len(self.read_entries())
+
+    def get_topics(self, max_topics: int = 8) -> str:
+        """Get compact topic list for display."""
+        entries = self.read_entries()
+        topics = []
+        for entry in entries:
+            # Extract topic from entry (after timestamp)
+            topic = re.sub(r'^\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\]\s*', '', entry)
+            topic = re.sub(r'^§\s*', '', topic)
+            topic = re.sub(r'[：:].*$', '', topic).strip()[:20]
+            if topic and topic not in topics:
+                topics.append(topic)
+            if len(topics) >= max_topics:
+                break
+        result = "、".join(topics)
+        if len(entries) > max_topics:
+            result += f" 等{len(entries)}项"
+        return result
+
+    def get_file_size(self) -> int:
+        """Get archive file size in bytes."""
+        if self.archive_file.exists():
+            return self.archive_file.stat().st_size
+        return 0
+
+    def _check_size(self):
+        """Compress old entries if archive exceeds 50KB."""
+        if not self.archive_file.exists():
+            return
+        size = self.archive_file.stat().st_size
+        if size <= 50 * 1024:
+            return
+        try:
+            content = self.archive_file.read_text(encoding="utf-8")
+            lines = content.split("\n")
+            # Keep header + entries from last 30 days
+            cutoff = datetime.now().strftime("%Y-%m-%d")
+            header_lines = []
+            recent_lines = []
+            old_count = 0
+            in_header = True
+            for line in lines:
+                if in_header and (line.startswith("[") and re.match(r'\[\d{4}-', line)):
+                    in_header = False
+                if in_header:
+                    header_lines.append(line)
+                    continue
+                # Check if entry is recent (within 30 days)
+                date_match = re.match(r'\[(\d{4}-\d{2}-\d{2})', line)
+                if date_match:
+                    entry_date = date_match.group(1)
+                    days_old = (datetime.now() - datetime.strptime(entry_date, "%Y-%m-%d")).days
+                    if days_old <= 30:
+                        recent_lines.append(line)
+                    else:
+                        old_count += 1
+                else:
+                    recent_lines.append(line)
+
+            if old_count > 0:
+                summary = f"\n[{cutoff}] [{old_count} older entries compressed]\n"
+                new_content = "\n".join(header_lines) + summary + "\n".join(recent_lines)
+                self.archive_file.write_text(new_content, encoding="utf-8")
+                logger.info("MIS: compressed %d old archive entries", old_count)
+        except Exception as e:
+            logger.error("MIS: archive compression failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# MIS MemoryStore (enhanced)
 # ---------------------------------------------------------------------------
 
 class MISMemoryStore(MemoryStore):
-    """MemoryStore subclass with MIS policy enforcement.
-    
-    All storage operations (persistence, § delimiter, dedup, drift detection,
-    file locking, threat scanning, char limits) are inherited from the native
-    MemoryStore. MIS only adds write-time validation at add() and replace().
-    """
+    """MemoryStore subclass with MIS policy enforcement."""
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
-        """Add entry with MIS policy check."""
         if target == "memory":
-            violation = _check_mis_policy(content)
+            violation = _check_mis_policy(content, self)
             if violation:
                 return {"success": False, "error": violation}
         return super().add(target, content)
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
-        """Replace entry with MIS policy check on new content."""
         if target == "memory":
-            violation = _check_mis_policy(new_content)
+            violation = _check_mis_policy(new_content, self)
             if violation:
                 return {"success": False, "error": violation}
         return super().replace(target, old_text, new_content)
 
     def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Batch operations with MIS policy check on all add/replace content."""
         if target == "memory":
             for i, op in enumerate(operations):
                 op = op or {}
                 act = op.get("action")
                 content = op.get("content", "")
                 if act in {"add", "replace"} and content:
-                    violation = _check_mis_policy(content)
+                    violation = _check_mis_policy(content, self)
                     if violation:
                         return {
                             "success": False,
@@ -226,74 +508,69 @@ class MISMemoryStore(MemoryStore):
 
 
 # ---------------------------------------------------------------------------
-# Tool schema — identical to native memory tool
+# Enhanced Tool Schema
 # ---------------------------------------------------------------------------
 
-# Re-export the native schema so the tool is wire-compatible.
-# We add MIS-specific guidance to the description.
 MIS_MEMORY_SCHEMA = {
     "name": "memory",
     "description": (
         "Save durable facts to persistent memory that survive across sessions. Memory is "
         "injected into every future turn, so keep entries compact and high-signal.\n\n"
         "MIS POLICY (enforced at code level):\n"
-        "- Memory stores INDEXES ONLY. Format: §项目名：详见 skill xxx\n"
-        "- Project details (tech stack, IPs, ports, API endpoints) belong in Skills.\n"
-        "- Use skill_manage(action='create') to store project details.\n"
-        "- User preferences and environment info are allowed in memory.\n\n"
-        "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
-        "{action, content?, old_text?}). The batch applies atomically and the char limit is "
-        "checked only on the FINAL result — so a single call can remove/replace stale entries "
-        "to free room AND add new ones, even when an add alone would overflow. The response "
-        "reports current/limit chars and confirms completion; one batch call finishes the "
-        "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
-        "single lone change.\n\n"
-        "WHEN: save proactively when the user states a preference, correction, or personal "
-        "detail, or you learn a stable fact about their environment, conventions, or workflow. "
-        "Priority: user preferences & corrections > environment facts > procedures. The best "
-        "memory stops the user repeating themselves.\n\n"
-        "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
-        "removes or shortens enough stale entries and adds the new one together.\n\n"
-        "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
-        "notes (environment, conventions, tool quirks, lessons).\n\n"
-        "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
-        "completed-work logs, temporary TODO state (use session_search for those). Reusable "
-        "procedures belong in a skill, not memory."
+        "- Memory stores SHORT INDEXES ONLY. Max 150 chars per entry.\n"
+        "- Format: §项目名：详见 skill xxx\n"
+        "- Overflow → auto-archived (not lost).\n\n"
+        "ACTIONS:\n"
+        "- add/replace/remove: standard memory operations\n"
+        "- search: search both MEMORY.md and archive by keyword\n"
+        "- promote: restore an archived entry to MEMORY.md\n"
+        "- status: show memory usage and archive stats\n"
+        "- archive: manually archive a MEMORY.md entry\n\n"
+        "HOW: make ALL changes in ONE call via 'operations' array for batch, "
+        "or use single action/content/old_text for one change.\n\n"
+        "TARGETS: 'memory' = your notes, 'user' = user profile.\n\n"
+        "SKIP: trivial info, raw data dumps, task progress, temporary TODO state."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
-                "description": "The action to perform (single-op shape). Omit when using 'operations'."
+                "enum": ["add", "replace", "remove", "search", "promote", "status", "archive"],
+                "description": (
+                    "add/replace/remove: standard ops (overflow auto-archived).\n"
+                    "search: keyword search across active + archive.\n"
+                    "promote: restore archived entry to MEMORY.md.\n"
+                    "status: memory usage stats.\n"
+                    "archive: manually archive a MEMORY.md entry."
+                ),
             },
             "target": {
                 "type": "string",
                 "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "description": "'memory' for notes, 'user' for user profile.",
             },
             "content": {
                 "type": "string",
-                "description": "The entry content. Required for 'add' and 'replace' (single-op shape)."
+                "description": "Entry content for add/replace.",
             },
             "old_text": {
                 "type": "string",
-                "description": "REQUIRED for 'replace' and 'remove' (single-op shape): a short unique substring identifying the existing entry to modify. Omit only for 'add'."
+                "description": "Substring identifying the entry for replace/remove/promote/archive.",
+            },
+            "keyword": {
+                "type": "string",
+                "description": "Search keyword for 'search' action.",
             },
             "operations": {
                 "type": "array",
-                "description": (
-                    "Batch shape: a list of operations applied atomically in one call "
-                    "against the final char budget. Preferred when making multiple changes "
-                    "or consolidating to make room. Each item is {action, content?, old_text?}."
-                ),
+                "description": "Batch: list of {action, content?, old_text?} applied atomically.",
                 "items": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-                        "content": {"type": "string", "description": "Entry content for add/replace."},
-                        "old_text": {"type": "string", "description": "Substring identifying the entry for replace/remove."},
+                        "content": {"type": "string"},
+                        "old_text": {"type": "string"},
                     },
                     "required": ["action"],
                 },
@@ -305,26 +582,53 @@ MIS_MEMORY_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
-# MemoryProvider implementation
+# MIS MemoryProvider — v2 Engine
 # ---------------------------------------------------------------------------
 
 class MISProvider(MemoryProvider):
-    """MIS MemoryProvider — program-level memory policy enforcement.
-    
-    Replaces the built-in memory tool with a version that validates all
-    writes against MIS policy before persisting.
+    """MIS MemoryProvider v2 — full memory lifecycle management.
+
+    Extends the built-in memory system with:
+    - Write validation (format, length, structure, dead references)
+    - Auto-archival on overflow (transparent to agent)
+    - Cross-layer search (active + archive)
+    - Archive promotion (restore archived entries)
+    - Per-session state (gateway concurrency safe)
+    - Access tracking (for stale detection)
+    - Session lifecycle hooks (maintenance, migration)
     """
+
+    def __init__(self):
+        self._store: Optional[MISMemoryStore] = None
+        self._session_id: str = ""
+        self._session_states: Dict[str, _SessionState] = {}
+        self._state_lock = threading.Lock()
+        self._archive = _ArchiveManager()
+        self._violations_cache: List[Dict[str, str]] = []
+
+    # -- State management ---------------------------------------------------
+
+    def _get_state(self, session_id: str = "") -> _SessionState:
+        sid = session_id or self._session_id or "_default"
+        with self._state_lock:
+            if sid not in self._session_states:
+                self._session_states[sid] = _SessionState(sid)
+            return self._session_states[sid]
+
+    def _cleanup_session(self, session_id: str):
+        with self._state_lock:
+            self._session_states.pop(session_id, None)
+
+    # -- Core lifecycle -----------------------------------------------------
 
     @property
     def name(self) -> str:
         return "mis"
 
     def is_available(self) -> bool:
-        """Always available — no external dependencies."""
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        """Initialize the MIS memory store from disk."""
         try:
             from hermes_cli.config import load_config
             config = load_config() or {}
@@ -341,176 +645,623 @@ class MISProvider(MemoryProvider):
         )
         self._store.load_from_disk()
         self._session_id = session_id
-        self._violations_cache: List[Dict[str, str]] = []
-        
-        # Scan on init
+
+        # Scan existing violations
         self._scan_and_cache_violations()
-        
+
         logger.info(
-            "MIS provider initialized (memory=%d/%d chars, user=%d/%d chars, violations=%d)",
+            "MIS v2 initialized (memory=%d/%d chars, archive=%d entries, violations=%d)",
             self._store._char_count("memory"), memory_char_limit,
-            self._store._char_count("user"), user_char_limit,
+            self._archive.count_entries(),
             len(self._violations_cache),
         )
 
+    def shutdown(self) -> None:
+        pass
+
+    # -- System prompt injection --------------------------------------------
+
     def system_prompt_block(self) -> str:
-        """Inject MIS policy awareness into system prompt."""
-        return (
-            "MEMORY STRATEGY: MIS (Memory-Index-Skill)\n"
-            "- Memory stores INDEXES ONLY. Format: §项目名：详见 skill xxx\n"
-            "- Skills store full project details (tech stack, architecture, APIs, etc.)\n"
-            "- User preferences and environment info are allowed in memory.\n"
-            "- Before writing project details to memory, create a Skill first.\n"
-            "- This policy is enforced at code level — violating writes are rejected.\n"
+        state = self._get_state()
+        max_len = _get_max_entry_length()
+        parts = []
+
+        # 1. Strategy (compact, ~50 tokens)
+        parts.append(
+            f"MEMORY STRATEGY: MIS (Memory-Index-Skill)\n"
+            f"- Memory stores SHORT indexes only (max {max_len} chars)\n"
+            f"- Format: §name：see skill xxx\n"
+            f"- Overflow → auto-archived (not lost)\n"
+            f"- Tools: memory(action='search/promote/status/archive')"
         )
+
+        # 2. Pending write failure warning
+        pending = state.pending_write_failure
+        if pending:
+            turns_ago = state.current_turn - pending.get("turn", 0)
+            parts.append(
+                f"\n⚠️ [MIS] Unsaved memory from {turns_ago} turns ago:\n"
+                f"  \"{pending['content'][:80]}\"\n"
+                f"  It will be auto-archived at session end."
+            )
+
+        # 3. Archive summary
+        archive_count = self._archive.count_entries()
+        if archive_count > 0:
+            topics = self._archive.get_topics(max_topics=6)
+            parts.append(
+                f"\n📦 [Archive] {archive_count} entries: {topics}\n"
+                f"  memory(action='search', keyword='...') to find"
+            )
+
+        # 4. Capacity warning
+        if self._store:
+            ratio = self._store._char_count("memory") / self._store._char_limit("memory")
+            if ratio > 0.85:
+                parts.append(f"\n⚡ [MIS] Memory at {ratio:.0%}")
+
+        return "\n".join(parts)
+
+    # -- Prefetch (before each API call) ------------------------------------
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Scan memory for MIS violations each turn.
-        
-        Returns a warning string if violations are found, empty string otherwise.
-        This ensures the LLM sees violations every turn until they're fixed.
-        """
-        self._scan_and_cache_violations()
-        
-        if not self._violations_cache:
-            return ""
+        state = self._get_state(session_id)
+        state.current_turn += 1
 
-        # Build a compact warning
-        lines = [
-            f"[MIS Alert] {len(self._violations_cache)} entry/entries in MEMORY.md "
-            f"violate MIS policy (should be in Skills, not Memory):"
+        # 1. Access tracking
+        self._track_access(query, state)
+
+        # 2. Capacity check + auto-evict
+        self._check_capacity(state)
+
+        # 3. Potential memory hint
+        parts = []
+        pot = state.potential_memory
+        if pot and pot.get("turn") == state.current_turn - 1:
+            parts.append(f"💡 [MIS] Worth remembering: \"{pot['content'][:80]}\"")
+            state.potential_memory = None
+
+        # 4. Violation scan
+        violations = self._scan_and_cache_violations()
+        if violations:
+            for v in violations[:3]:
+                parts.append(f"[MIS Alert] {v['entry']}... → {v['reason']}")
+
+        return "\n".join(parts)
+
+    # -- Per-turn hooks -----------------------------------------------------
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        pass  # turn counting is done in prefetch
+
+    def sync_turn(self, user_content: str, assistant_content: str, **kwargs) -> None:
+        """Scan conversation for memory-worthy content (no LLM, pattern-based)."""
+        session_id = kwargs.get("session_id", "")
+        state = self._get_state(session_id)
+
+        _MEMORY_WORTHY_PATTERNS = [
+            re.compile(r'(?:我|用户)(?:喜欢|讨厌|偏好|习惯|不(?:喜欢|要))', re.I),
+            re.compile(r'(?:记住|记一下|帮我记|备忘)', re.I),
+            re.compile(r'(?:密码|token|key|端口|IP)\s*[：:]\s*\S+', re.I),
+            re.compile(r'(?:以后|以后都|每次|总是|不要)(?:用|做|走|按)', re.I),
         ]
-        for v in self._violations_cache[:5]:  # show max 5
-            lines.append(f"  - [{v['reason']}] {v['entry']}")
-        if len(self._violations_cache) > 5:
-            lines.append(f"  ... and {len(self._violations_cache) - 5} more")
-        lines.append(
-            "Action required: migrate these entries to Skills using "
-            "skill_manage(action='create') and replace them with index lines "
-            "using memory(action='replace')."
-        )
-        return "\n".join(lines)
+        for pattern in _MEMORY_WORTHY_PATTERNS:
+            if pattern.search(user_content):
+                state.potential_memory = {
+                    "content": user_content[:200],
+                    "turn": state.current_turn,
+                }
+                break
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Extract key info before context compression."""
+        keywords = ["记住", "记一下", "帮我记", "§", "preference", "remember", "prefer"]
+        extracted = []
+        for msg in messages[-20:]:
+            content = msg.get("content", "")
+            if isinstance(content, str) and any(kw in content for kw in keywords):
+                extracted.append(content[:150])
+
+        if extracted:
+            return (
+                "[MIS Pre-Compress] Unsaved memory-worthy content:\n"
+                + "\n".join(f"  - {e[:100]}" for e in extracted[-5:])
+            )
+        return ""
+
+    # -- Memory write hook --------------------------------------------------
+
+    def on_memory_write(self, action: str, target: str, content: str,
+                        metadata: Optional[Dict[str, Any]] = None) -> None:
+        if target == "memory" and action in {"add", "replace"}:
+            violation = _check_mis_policy(content, self._store)
+            if violation:
+                logger.warning("MIS violation in on_memory_write (%s): %s", action, violation[:200])
+
+    # -- Session lifecycle hooks --------------------------------------------
+
+    def on_session_switch(self, new_session_id: str, *, reset: bool = False,
+                          parent_session_id: str = "", **kwargs) -> None:
+        """Handle /new, /reset, /resume — migrate pending writes, clean state."""
+        # Migrate pending writes from old session
+        old_id = parent_session_id or self._session_id
+        if old_id:
+            old_state = self._get_state(old_id)
+            pending = old_state.pending_write_failure
+            if pending and pending.get("content"):
+                archived = self._archive.append_entry(pending["content"])
+                if archived:
+                    self._leave_archive_reference(pending["content"])
+                    logger.info("MIS: migrated pending write to archive on session switch")
+                old_state.pending_write_failure = None
+
+            # Cleanup old session state
+            if reset:
+                self._cleanup_session(old_id)
+
+        self._session_id = new_session_id
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Force-archive pending writes + maintenance scan."""
+        state = self._get_state()
+
+        # 1. Force-archive pending writes
+        pending = state.pending_write_failure
+        if pending and pending.get("content"):
+            archived = self._archive.append_entry(pending["content"])
+            if archived:
+                self._leave_archive_reference(pending["content"])
+                logger.info("MIS: force-archived pending write at session end")
+            state.pending_write_failure = None
+
+        # 2. Maintenance scan (log only, no auto-action)
+        stale = self._find_stale_entries(days=14)
+        dead = self._find_dead_references_all()
+        if stale or dead:
+            logger.info("MIS: session end — %d stale, %d dead refs", len(stale), len(dead))
+
+        # 3. Cleanup session state
+        self._cleanup_session(self._session_id)
+
+    def on_delegation(self, task: str, result: str, *,
+                      child_session_id: str = "", **kwargs) -> None:
+        pass  # Track delegation memory if needed in future
+
+    # -- Tool schemas -------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return the memory tool schema (identical to native, with MIS guidance)."""
         return [MIS_MEMORY_SCHEMA]
 
-    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        """Dispatch memory tool calls to MISMemoryStore."""
-        action = args.get("action", "")
-        target = args.get("target", "memory")
-        content = args.get("content")
-        old_text = args.get("old_text")
-        operations = args.get("operations")
+    # -- Tool call dispatch -------------------------------------------------
 
-        if target not in {"memory", "user"}:
-            return json.dumps(
-                {"success": False, "error": f"Invalid target '{target}'. Use 'memory' or 'user'."},
-                ensure_ascii=False,
-            )
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        action = args.get("action", "")
+        session_id = kwargs.get("session_id", "")
+        state = self._get_state(session_id)
+
+        # New operations
+        if action == "search":
+            return self._handle_search(args)
+        elif action == "promote":
+            return self._handle_promote(args, state)
+        elif action == "status":
+            return self._handle_status(state)
+        elif action == "archive":
+            return self._handle_archive(args)
+
+        # Enhanced existing operations
+        if action == "add":
+            return self._handle_add_enhanced(args, state)
+        elif action == "replace":
+            return self._handle_replace(args)
+        elif action == "remove":
+            return self._handle_remove(args)
+        elif action == "":
+            # No action — check if operations batch
+            operations = args.get("operations")
+            if operations:
+                target = args.get("target", "memory")
+                result = self._store.apply_batch(target, operations)
+                return json.dumps(result, ensure_ascii=False)
+            return json.dumps({"success": False, "error": "action required"})
+
+        return json.dumps({"success": False, "error": f"Unknown action: {action}"})
+
+    # -- Tool handlers ------------------------------------------------------
+
+    def _handle_add_enhanced(self, args: Dict, state: _SessionState) -> str:
+        """Enhanced add: overflow auto-archived instead of error."""
+        content = args.get("content", "").strip()
+        target = args.get("target", "memory")
+        operations = args.get("operations")
 
         # Batch path
         if operations:
             if not isinstance(operations, list):
-                return json.dumps(
-                    {"success": False, "error": "operations must be a list."},
-                    ensure_ascii=False,
-                )
+                return json.dumps({"success": False, "error": "operations must be a list"})
             result = self._store.apply_batch(target, operations)
             return json.dumps(result, ensure_ascii=False)
 
-        # Single-op path
-        if action == "add":
-            if not content:
-                return json.dumps(
-                    {"success": False, "error": "Content is required for 'add' action."},
-                    ensure_ascii=False,
-                )
+        if not content:
+            return json.dumps({"success": False, "error": "content required for add"})
+
+        # User profile — pass through
+        if target != "memory":
             result = self._store.add(target, content)
+            return json.dumps(result, ensure_ascii=False)
 
-        elif action == "replace":
-            if not old_text:
-                return self._missing_old_text_error(target, "replace")
-            if not content:
-                return json.dumps(
-                    {"success": False, "error": "content is required for 'replace' action."},
-                    ensure_ascii=False,
-                )
-            result = self._store.replace(target, old_text, content)
+        # Policy check
+        violation = _check_mis_policy(content, self._store)
+        if violation:
+            return json.dumps({"success": False, "error": violation}, ensure_ascii=False)
 
-        elif action == "remove":
-            if not old_text:
-                return self._missing_old_text_error(target, "remove")
-            result = self._store.remove(target, old_text)
+        # Try write
+        result = self._store.add("memory", content)
 
-        else:
-            return json.dumps(
-                {"success": False, "error": f"Unknown action '{action}'. Use: add, replace, remove"},
-                ensure_ascii=False,
-            )
+        # Success
+        if result.get("success"):
+            state.pending_write_failure = None
+            return json.dumps(result, ensure_ascii=False)
+
+        # Capacity overflow → auto-archive
+        if "limit" in str(result.get("error", "")):
+            archived = self._archive.append_entry(content)
+            if archived:
+                self._leave_archive_reference(content)
+                state.pending_write_failure = None
+                return json.dumps({
+                    "success": True,
+                    "archived": True,
+                    "message": "[MIS] Entry auto-archived (MEMORY.md full). "
+                               "Use memory(action='search') to find it.",
+                }, ensure_ascii=False)
+
+            # Archive also failed → persist failure state
+            state.pending_write_failure = {
+                "content": content[:300],
+                "error": "archive_failed",
+                "turn": state.current_turn,
+            }
+            return json.dumps({
+                "success": False,
+                "error": "Both MEMORY.md and archive write failed. "
+                         "Data preserved in conversation history. "
+                         "Will be auto-archived at session end.",
+            }, ensure_ascii=False)
 
         return json.dumps(result, ensure_ascii=False)
 
-    def on_memory_write(
-        self,
-        action: str,
-        target: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Hook called after native memory writes (for observability)."""
-        if target == "memory" and action in {"add", "replace"}:
-            violation = _check_mis_policy(content)
-            if violation:
-                logger.warning(
-                    "MIS violation in on_memory_write hook (action=%s): %s",
-                    action, violation[:200],
-                )
+    def _handle_replace(self, args: Dict) -> str:
+        old_text = args.get("old_text", "")
+        content = args.get("content", "")
+        target = args.get("target", "memory")
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Rescan violations at session end."""
-        self._scan_and_cache_violations()
-        if self._violations_cache:
-            logger.info(
-                "MIS: session ended with %d unresolved violation(s)",
-                len(self._violations_cache),
-            )
+        if not old_text:
+            return self._missing_old_text_error(target, "replace")
+        if not content:
+            return json.dumps({"success": False, "error": "content required for replace"})
 
-    def shutdown(self) -> None:
-        """Clean shutdown."""
-        pass
+        result = self._store.replace(target, old_text, content)
+        return json.dumps(result, ensure_ascii=False)
 
-    # -- Internal helpers --
+    def _handle_remove(self, args: Dict) -> str:
+        old_text = args.get("old_text", "")
+        target = args.get("target", "memory")
 
-    def _scan_and_cache_violations(self) -> None:
-        """Scan current memory entries for violations and cache results."""
+        if not old_text:
+            return self._missing_old_text_error(target, "remove")
+
+        result = self._store.remove(target, old_text)
+        return json.dumps(result, ensure_ascii=False)
+
+    def _handle_search(self, args: Dict) -> str:
+        """Cross-layer search: MEMORY.md + archive."""
+        keyword = args.get("keyword", "").strip()
+        if not keyword:
+            return json.dumps({"success": False, "error": "keyword required"})
+
+        results = []
+        keyword_lower = keyword.lower()
+
+        # Search active
+        for entry in self._store._entries_for("memory"):
+            if keyword_lower in entry.lower():
+                results.append({"layer": "active", "entry": entry})
+
+        # Search archive
+        for entry in self._archive.read_entries():
+            if keyword_lower in entry.lower():
+                results.append({"layer": "archive", "entry": entry})
+
+        return json.dumps({
+            "success": True,
+            "keyword": keyword,
+            "matches": len(results),
+            "results": results[:20],
+        }, ensure_ascii=False)
+
+    def _handle_promote(self, args: Dict, state: _SessionState) -> str:
+        """Restore archived entry to MEMORY.md. Anti-loop: evict first, then write."""
+        old_text = args.get("old_text", "").strip()
+        if not old_text:
+            return json.dumps({"success": False, "error": "old_text required"})
+
+        # Search archive
+        archive_entries = self._archive.read_entries()
+        matched = [e for e in archive_entries if old_text.lower() in e.lower()]
+        if not matched:
+            return json.dumps({"success": False, "error": f"No match in archive for: {old_text}"})
+
+        entry = matched[0]
+        # Strip timestamp prefix
+        clean = re.sub(r'^\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\]\s*', '', entry).strip()
+
+        # Check if already exists
+        for existing in self._store._entries_for("memory"):
+            if clean.lower() in existing.lower() or existing.lower() in clean.lower():
+                return json.dumps({"success": False, "error": "Already exists in MEMORY.md"})
+
+        # Evict first if needed (anti-loop: use _force_evict, not _handle_add)
+        current = self._store._char_count("memory")
+        limit = self._store._char_limit("memory")
+        if current + len(clean) > limit * 0.93:
+            evicted = self._force_evict_for_space(len(clean))
+            if not evicted:
+                return json.dumps({
+                    "success": False,
+                    "error": "Cannot make room (all entries are P0)"
+                })
+
+        # Direct write (bypass add enhancement to avoid re-archive loop)
+        result = self._store.add("memory", clean)
+        if result.get("success"):
+            self._archive.remove_entry(entry)
+            return json.dumps({
+                "success": True,
+                "promoted": clean[:80],
+            }, ensure_ascii=False)
+
+        return json.dumps(result, ensure_ascii=False)
+
+    def _handle_status(self, state: _SessionState) -> str:
+        active = self._store._entries_for("memory")
+        active_chars = self._store._char_count("memory")
+        active_limit = self._store._char_limit("memory")
+        archive_count = self._archive.count_entries()
+        archive_size = self._archive.get_file_size()
+
+        return json.dumps({
+            "success": True,
+            "active": {
+                "entries": len(active),
+                "chars": active_chars,
+                "limit": active_limit,
+                "usage_pct": round(active_chars / active_limit * 100, 1) if active_limit else 0,
+            },
+            "archive": {
+                "entries": archive_count,
+                "size_kb": round(archive_size / 1024, 1),
+            },
+            "pending_write_failure": state.pending_write_failure is not None,
+        }, ensure_ascii=False)
+
+    def _handle_archive(self, args: Dict) -> str:
+        """Manually archive a MEMORY.md entry."""
+        old_text = args.get("old_text", "").strip()
+        if not old_text:
+            return json.dumps({"success": False, "error": "old_text required"})
+
+        entries = self._store._entries_for("memory")
+        matched = [e for e in entries if old_text.lower() in e.lower()]
+        if not matched:
+            return json.dumps({"success": False, "error": f"No match for: {old_text}"})
+
+        entry = matched[0]
+        if _classify_priority(entry) == "P0":
+            return json.dumps({
+                "success": False,
+                "error": "P0 entries (core preferences) cannot be archived"
+            })
+
+        self._store.remove("memory", entry)
+        self._archive.append_entry(entry)
+        self._leave_archive_reference(entry)
+        return json.dumps({"success": True, "archived": entry[:80]}, ensure_ascii=False)
+
+    # -- Internal helpers ---------------------------------------------------
+
+    def _track_access(self, query: str, state: _SessionState):
+        """Keyword-based access tracking."""
+        query_lower = query.lower()
+        for entry in self._store._entries_for("memory"):
+            keywords = _extract_keywords(entry)
+            if any(kw.lower() in query_lower for kw in keywords if len(kw) > 2):
+                state.access_log[entry] = {
+                    "last_seen": datetime.now().isoformat(),
+                    "count": state.access_log.get(entry, {}).get("count", 0) + 1,
+                }
+
+    def _check_capacity(self, state: _SessionState):
+        """Auto-evict when memory exceeds 95%."""
+        ratio = self._store._char_count("memory") / self._store._char_limit("memory")
+        if ratio > 0.95:
+            self._auto_evict(state, target_ratio=0.85)
+
+    def _auto_evict(self, state: _SessionState, target_ratio: float = 0.85):
+        """Evict low-priority entries to archive."""
+        entries = self._store._entries_for("memory")
+        ranked = sorted(entries, key=lambda e: (
+            _priority_rank(e),
+            self._get_last_accessed_rank(e, state),
+        ))
+
+        target_chars = int(self._store._char_limit("memory") * target_ratio)
+        for entry in ranked:
+            if _classify_priority(entry) == "P0":
+                break
+            if self._store._char_count("memory") <= target_chars:
+                break
+            self._store.remove("memory", entry)
+            self._archive.append_entry(entry)
+            logger.info("MIS: auto-evicted entry (%d chars)", len(entry))
+
+    def _force_evict_for_space(self, needed_chars: int) -> bool:
+        """Precisely evict entries to make room (for promote)."""
+        entries = self._store._entries_for("memory")
+        ranked = sorted(entries, key=lambda e: _priority_rank(e))
+
+        freed = 0
+        for entry in ranked:
+            if _classify_priority(entry) == "P0":
+                return False
+            if freed >= needed_chars:
+                return True
+            freed += len(entry)
+            self._store.remove("memory", entry)
+            self._archive.append_entry(entry)
+
+        return freed >= needed_chars
+
+    def _get_last_accessed_rank(self, entry: str, state: _SessionState) -> int:
+        """Return negative timestamp for sorting (most recent first)."""
+        log = state.access_log.get(entry)
+        if log:
+            return -int(log.get("count", 0))
+        return 0
+
+    def _leave_archive_reference(self, entry: str):
+        """Leave a reference line in MEMORY.md after archiving."""
+        topic = re.sub(r'^§\s*', '', entry)
+        topic = re.sub(r'[：:].*$', '', topic).strip()[:25]
+        ref_line = f"§[归档] {topic}：详见 memory-archive"
+        current = self._store._char_count("memory")
+        limit = self._store._char_limit("memory")
+        if current + len(ref_line) < limit * 0.93:
+            self._store.add("memory", ref_line)
+
+    def _find_stale_entries(self, days: int = 14) -> List[str]:
+        """Find entries not accessed in N days (session-local tracking)."""
+        state = self._get_state()
+        stale = []
+        now = datetime.now()
+        for entry in self._store._entries_for("memory"):
+            if _classify_priority(entry) == "P0":
+                continue
+            log = state.access_log.get(entry)
+            if not log:
+                # Not accessed this session — check if entry is old
+                continue
+            try:
+                last = datetime.fromisoformat(log["last_seen"])
+                if (now - last).days >= days:
+                    stale.append(entry[:60])
+            except (ValueError, KeyError):
+                pass
+        return stale
+
+    def _find_dead_references_all(self) -> List[str]:
+        """Scan all entries for dead skill references."""
+        dead = []
+        for entry in self._store._entries_for("memory"):
+            refs = _find_dead_references(entry)
+            if refs:
+                dead.extend(refs)
+        return dead
+
+    def _scan_and_cache_violations(self) -> List[Dict[str, str]]:
         try:
             entries = self._store._entries_for("memory")
             self._violations_cache = scan_memory_violations(entries)
         except Exception as e:
             logger.debug("MIS violation scan failed: %s", e)
             self._violations_cache = []
+        return self._violations_cache
 
     def _missing_old_text_error(self, target: str, action: str) -> str:
-        """Error for replace/remove without old_text."""
         entries = self._store._entries_for(target)
         current = self._store._char_count(target)
         limit = self._store._char_limit(target)
-        return json.dumps(
-            {
-                "success": False,
-                "error": (
-                    f"'{action}' needs old_text — a short unique substring of the entry "
-                    f"to {action}. None was provided. Reissue the {action} with old_text "
-                    f"set to part of one of the current_entries below."
-                ),
-                "current_entries": entries,
-                "usage": f"{current:,}/{limit:,}",
-            },
-            ensure_ascii=False,
-        )
+        return json.dumps({
+            "success": False,
+            "error": (
+                f"'{action}' needs old_text — a short unique substring of the entry "
+                f"to {action}. None was provided."
+            ),
+            "current_entries": entries,
+            "usage": f"{current:,}/{limit:,}",
+        }, ensure_ascii=False)
+
+    # -- Migration (one-time) -----------------------------------------------
+
+    def migrate_v1(self) -> Dict[str, Any]:
+        """One-time migration: clean MEMORY.md + establish archive. With rollback."""
+        backup_path = self._backup_memory()
+
+        try:
+            entries = self._store._entries_for("memory")
+            active = []
+            archived = []
+            deleted = []
+
+            for entry in entries:
+                priority = _classify_priority(entry)
+                dead = _find_dead_references(entry)
+
+                if priority == "P3":
+                    deleted.append(entry)
+                elif dead and priority != "P0":
+                    archived.append(entry)
+                elif priority == "P2":
+                    archived.append(entry)
+                else:
+                    active.append(entry)
+
+            # Deduplicate
+            seen = set()
+            deduped = []
+            for entry in active:
+                key = re.sub(r'\s+', ' ', entry.strip().lower())
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(entry)
+            active = deduped
+
+            # Write new MEMORY.md
+            self._store._set_entries("memory", active)
+
+            # Archive
+            for entry in archived:
+                self._archive.append_entry(entry)
+
+            return {
+                "success": True,
+                "active": len(active),
+                "archived": len(archived),
+                "deleted": len(deleted),
+                "backup": str(backup_path),
+                "total_chars": self._store._char_count("memory"),
+            }
+        except Exception as e:
+            # Rollback
+            self._restore_from_backup(backup_path)
+            logger.error("MIS: migration failed, rolled back: %s", e)
+            return {"success": False, "error": str(e), "rolled_back": True}
+
+    def _backup_memory(self) -> Path:
+        src = self._store._path_for("memory")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bak = src.parent / f"MEMORY.md.bak.{ts}"
+        if src.exists():
+            shutil.copy2(src, bak)
+        return bak
+
+    def _restore_from_backup(self, backup_path: Path):
+        if backup_path.exists():
+            target = self._store._path_for("memory")
+            shutil.copy2(backup_path, target)
+            self._store.load_from_disk()
 
 
 # ---------------------------------------------------------------------------
-# Plugin registration — Hermes discovers this via MemoryProvider subclass
+# Plugin registration
 # ---------------------------------------------------------------------------

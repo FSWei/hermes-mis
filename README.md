@@ -1,245 +1,209 @@
-# Hermes MIS (Memory-Index-Skill)
+# Hermes MIS v2 (Memory-Index-Skill)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Hermes Agent](https://img.shields.io/badge/Hermes-Agent-blue.svg)](https://github.com/NousResearch/hermes-agent)
 
-**Program-level memory policy enforcement for Hermes Agent. Memory stores indexes only, Skills store details. Zero-install, zero-dependency.**
+**Two-layer memory management engine for Hermes Agent. Active layer + archive layer with auto-archival, cross-layer search, access tracking, and write-failure recovery.**
 
 [中文文档](README.zh-CN.md)
 
 ---
 
-## 🎯 What is MIS?
+## 🎯 What is MIS v2?
 
-Hermes's default Memory has only ~2200 bytes, which fills up quickly with detailed project information.
+MIS is a Hermes MemoryProvider plugin that replaces the default flat memory system with a managed two-layer architecture:
 
-MIS (Memory-Index-Skill) splits Memory into three layers:
-- **Memory (Index Layer)**: Only stores index lines, ~50 bytes each
-- **Skill (Storage Layer)**: Stores complete project content, each can be tens of thousands of bytes
-- **SOUL (Rule Layer)**: Injects MIS rules, automatically applied every turn
+### Layer 1: Active (MEMORY.md)
+- Always injected into system prompt (~2,200 chars)
+- Short index lines only: `§project：see skill xxx`
+- Write validation at code level (format, length, structure, dead references)
 
-**The difference from prompt-based approaches:** MIS enforces its policy at the **code level**. When the LLM tries to write project details to Memory, the write is **rejected** with a clear error message. This is not a suggestion — it's a program-level gate.
+### Layer 2: Archive (memory-archive skill)
+- Auto-created on first eviction
+- Entries with timestamps, searchable via `memory(action='search')`
+- Restorable via `memory(action='promote')`
+- 50KB soft limit with automatic compression
 
-**Result: 10 projects = 10 index lines ≈ 500 bytes, effective capacity 100+ KB, ~100x expansion.**
+**Key difference from prompt-based approaches:** All constraints enforced at code level, not prompt level.
 
 ---
 
-## 🚀 Quick Start
+## ✨ v2 Features
 
-### One-Command Install
+| Feature | Description |
+|---------|-------------|
+| **Auto-archival** | Overflow entries archived transparently (no error) |
+| **Cross-layer search** | `memory(action='search', keyword='...')` searches both layers |
+| **Archive promotion** | `memory(action='promote', old_text='...')` restores archived entries |
+| **Status dashboard** | `memory(action='status')` shows usage stats |
+| **Manual archive** | `memory(action='archive', old_text='...')` manually archive entries |
+| **Write-failure recovery** | 4-level fallback chain, data never lost |
+| **Access tracking** | Keyword-based, per-session, no LLM calls |
+| **Priority eviction** | P0 (core) → P1 (env) → P2 (project) → P3 (temp) |
+| **Dead reference detection** | Detects references to non-existent skills |
+| **Concurrency safe** | Per-session state for gateway multi-session |
+| **Pre-compress save** | Extracts key info before context compression |
+| **Fact detection** | Scans conversation for memory-worthy content |
+
+---
+
+## 🚀 Quick Install
 
 ```bash
+# One command
 hermes plugins install FSWei/hermes-mis
-```
 
-### Activate
-
-```bash
+# Enable
 hermes plugins enable mis
+hermes memory provider mis
 ```
 
-Then set MIS as your memory provider. Edit `~/.hermes/config.yaml` (or `~/.hermes/profiles/<profile>/config.yaml`):
-
-```yaml
-memory:
-  provider: mis
-```
-
-Or use the interactive setup:
-```bash
-hermes memory setup
-```
-
-### Verify
+Or manual install:
 
 ```bash
-hermes memory status
-# Should show: Provider: mis
-```
+# Copy plugin files
+mkdir -p ~/.hermes/plugins/memory/mis
+cp plugin/__init__.py ~/.hermes/plugins/memory/mis/
+cp plugin/plugin.yaml ~/.hermes/plugins/memory/mis/
 
-**That's it.** No pip install, no npm install, no external services, no API keys.
-
----
-
-## 📖 Before & After Example
-
-### Before MIS
-
-```
-Memory (2200 bytes, 100% full):
-────────────────────────────────────────────────────────────────────
-my-webapp — React+Node.js+PostgreSQL e-commerce platform. 
-Server 10.0.1.100. JWT authentication: implemented. Payment 
-integration: Stripe API. Database migrations: see skill my-webapp 
-Pitfall #12. Redis caching for product listings...
-
-my-api — FastAPI+Python REST API service. Server 10.0.1.101. 
-Endpoints: /users, /products, /orders. Rate limiting: 100 req/min. 
-API docs at /docs endpoint...
-
-[ONLY 3-5 PROJECTS FIT!]
-```
-
-### After MIS
-
-```
-Memory (500 bytes, 23% used):
-────────────────────────────────────────────────────────────────────
-§my-webapp：详见 skill my-webapp。
-§my-api：详见 skill my-api。
-§my-blog：详见 skill my-blog。
-§my-bot：详见 skill my-bot。
-§my-tools：详见 skill my-tools。
-§user-config：详见 skill user-config。
-§platform-a：详见 skill platform-a。
-§project-x：详见 skill project-x。
-
-[10+ PROJECTS FIT! 100+ KB EFFECTIVE CAPACITY]
+# Enable
+hermes plugins enable mis
+hermes memory provider mis
 ```
 
 ---
 
-## 🔧 How It Works
+## 📖 Usage
 
-### Architecture
+### Standard Operations (backward compatible)
 
-```
-Native MemoryStore (tools/memory_tool.py)
-    └── MISMemoryStore (inherits ALL storage logic)
-            └── MISProvider (MemoryProvider plugin)
-                    ├── add() → MIS policy check → super().add()
-                    ├── replace() → MIS policy check → super().replace()
-                    ├── apply_batch() → MIS policy check → super().apply_batch()
-                    └── prefetch() → scan all entries for violations each turn
-```
+```python
+# Add index line
+memory(action='add', target='memory', content='§project：详见 skill my-project')
 
-**Zero reimplementation.** All storage operations (persistence, § delimiter, dedup, drift detection, file locking, threat scanning, char limits) are inherited from the native `MemoryStore`. MIS only adds validation at write entry points.
+# Replace entry
+memory(action='replace', target='memory', old_text='old content', content='new content')
 
-### Policy Enforcement
-
-| Content Type | Target | Result |
-|---|---|---|
-| `§name：详见 skill xxx` | memory | ✅ Allowed |
-| Server IPs, ports, tech stack | memory | ❌ **Rejected** |
-| API endpoints, credentials | memory | ❌ **Rejected** |
-| User preferences, env info | memory | ✅ Allowed |
-| Anything | user | ✅ Allowed |
-
-When a write is rejected, the LLM receives:
-```
-[MIS Policy] Content contains project details (server IP address, port number).
-Memory only accepts index lines. Store project details in a Skill instead.
-
-Correct format:
-  memory(action='add', target='memory', content='§项目名：详见 skill skill-name。')
-
-To create a Skill:
-  skill_manage(action='create', name='skill-name', content='...')
+# Remove entry
+memory(action='remove', target='memory', old_text='content to remove')
 ```
 
-### Per-Turn Scanning
+### New v2 Operations
 
-Even if existing memory entries have violations (from before MIS was installed), the plugin scans all entries each turn via `prefetch()` and injects a warning:
+```python
+# Search across both layers
+memory(action='search', keyword='distillyourself')
+# → {"matches": 3, "results": [{"layer": "active", "entry": "..."}, {"layer": "archive", "entry": "..."}]}
 
-```
-[MIS Alert] 2 entry/entries in MEMORY.md violate MIS policy:
-  - [server IP address] 服务器 59.110.226.32，/opt/distill/...
-  - [tech stack] 技术栈：Vue 3 + Express + SQLite...
-Action required: migrate these entries to Skills...
+# Restore archived entry
+memory(action='promote', old_text='distillyourself')
+# → {"success": true, "promoted": "§distillyourself.cn：详见 skill distillyourself"}
+
+# View memory status
+memory(action='status')
+# → {"active": {"entries": 12, "chars": 1008, "limit": 2200, "usage_pct": 45.8}, "archive": {"entries": 14, "size_kb": 1.7}}
+
+# Manually archive an entry
+memory(action='archive', old_text='old project')
+# → {"success": true, "archived": "§old project：详见 skill xxx"}
 ```
 
 ---
 
-## 📦 What's Included
+## 🏗️ Architecture
 
 ```
-hermes-mis/
-├── plugin/               # Hermes MemoryProvider plugin
-│   ├── plugin.yaml       # Plugin metadata
-│   └── __init__.py       # MISProvider + MISMemoryStore + policy engine
-├── SKILL.md              # Hermes Skill (migration guide + reference)
-├── README.md             # This file
-├── README.zh-CN.md       # 中文文档
-├── LICENSE
-└── .gitignore
+┌─────────────────────────────────────────────────────┐
+│  Layer 1: ACTIVE (MEMORY.md)                        │
+│  • Always in system prompt                          │
+│  • 2,200 char hard limit                            │
+│  • Write validation (code-level)                    │
+│  • Priority: P0 (never evict) → P3 (evict first)   │
+├─────────────────────────────────────────────────────┤
+│  Layer 2: ARCHIVE (memory-archive skill)            │
+│  • Created automatically on first eviction          │
+│  • Timestamped entries, searchable                  │
+│  • 50KB soft limit with compression                 │
+│  • Summary injected via system_prompt_block()       │
+└─────────────────────────────────────────────────────┘
+```
+
+### MemoryProvider Hooks Used
+
+| Hook | Purpose |
+|------|---------|
+| `system_prompt_block()` | Inject strategy + archive summary + warnings |
+| `prefetch(query)` | Access tracking + capacity check + fact hints |
+| `sync_turn(user, asst)` | Conversation fact detection |
+| `on_pre_compress(msgs)` | Save key info before compression |
+| `on_session_end(msgs)` | Force-archive pending writes + maintenance |
+| `on_session_switch()` | Migrate pending writes on /new |
+| `handle_tool_call()` | Enhanced add + search/promote/status/archive |
+
+---
+
+## 🔒 Policy Enforcement
+
+### Write Validation (code-level, not prompt)
+
+```
+< 50 chars   → Always allowed (preferences)
+50-150 chars → Allowed if no structure
+150-200 chars → Allowed with suggestion (gray zone)
+> 200 chars  → Rejected
+Structured content (lists, tables, steps) → Rejected
+Dead skill references → Rejected
+Domain details (IPs, passwords, schemas) → Rejected
+```
+
+### Priority Classification (pattern-based, no LLM)
+
+```
+P0: 偏好, 讨厌, 隐私极强, 用户期望  → Never evicted
+P1: 环境, 认证, 基础设施            → Evict last
+P2: §xxx：详见 skill xxx            → Evict when needed
+P3: 临时, 告警缓存, 已加入备份       → Evict first
+```
+
+### Auto-Eviction
+
+When memory exceeds 95%:
+1. Sort entries by priority (P3 first) + access time (oldest first)
+2. Evict to archive until 85% utilization
+3. Leave reference line in MEMORY.md: `§[归档] topic：详见 memory-archive`
+
+### Write-Failure Recovery (4-level)
+
+```
+Level 1: Overflow → auto-archive (transparent)
+Level 2: Archive fails → persist failure state + system prompt warning
+Level 3: /new → migrate pending writes to archive
+Level 4: session end → force-archive (data never lost)
 ```
 
 ---
 
-## 🔄 Migration Guide
+## 📊 Token Impact
 
-After installing, existing memory entries may need migration:
-
-1. **Read your memory file:**
-   ```
-   read_file(path='~/.hermes/memories/MEMORY.md')
-   # Or for profiles: ~/.hermes/profiles/<profile>/memories/MEMORY.md
-   ```
-
-2. **For each project detail entry, create a Skill and replace:**
-   ```
-   # Create Skill with full details
-   skill_manage(action='create', name='my-project', content='full project info here...')
-   
-   # Replace Memory entry with index line
-   memory(action='replace', target='memory',
-          old_text='old project detail text',
-          content='§my-project：详见 skill my-project。')
-   ```
-
-3. **Verify:** `prefetch()` returns empty when all violations are resolved.
+| Component | Condition | Tokens |
+|-----------|-----------|--------|
+| system_prompt_block (strategy) | Always | ~50 |
+| system_prompt_block (archive summary) | When archive exists | 0-50 |
+| system_prompt_block (warnings) | When issues exist | 0-40 |
+| **Normal operation** | | **~50/turn** |
+| **With archive + warnings** | | **~140/turn** |
 
 ---
 
-## ⚙️ Configuration
+## 🤝 Contributing
 
-```yaml
-# config.yaml
-memory:
-  provider: mis                    # Activate MIS
-  memory_char_limit: 2200         # Memory store char limit (default: 2200)
-  user_char_limit: 1375           # User profile char limit (default: 1375)
+```bash
+git clone https://github.com/FSWei/hermes-mis.git
+cd hermes-mis
+# Edit plugin/__init__.py
+# Test: hermes -p test-profile chat -q "test memory"
 ```
-
----
-
-## 🆚 Comparison
-
-| Feature | Prompt-Only MIS | **MIS Plugin** |
-|---|---|---|
-| Policy enforcement | LLM "should follow" rules | **Code-level rejection** |
-| Reliability | ~70% (LLM may ignore) | **~100% (programmatic)** |
-| Per-turn scanning | Manual (SOUL.md rule) | **Automatic (prefetch)** |
-| Installation | Edit SOUL.md manually | **`hermes plugins install`** |
-| Updates | Manual SKILL.md edits | **`hermes plugins update`** |
-| Dependencies | None | None |
-| Storage implementation | N/A (uses native) | **Inherits native MemoryStore** |
-
----
-
-## ❓ FAQ
-
-**Q: Will this break my existing memory?**
-A: No. MIS only adds validation for NEW writes. Existing entries are preserved. The `prefetch()` scan will flag old violations as warnings until you migrate them.
-
-**Q: Can I use MIS with MCP memory tools (engram, gbrain, etc.)?**
-A: Yes. MIS replaces the built-in memory tool. MCP tools are separate and work alongside it.
-
-**Q: What if Hermes updates break the plugin?**
-A: The plugin imports `MemoryStore` from Hermes's internal API. If Hermes restructures, the plugin will fail with a clear error message. Update the plugin or switch back to built-in: `hermes memory setup`.
-
-**Q: Does this affect the `user` target?**
-A: No. MIS policy only validates `target='memory'`. The `target='user'` store is unrestricted.
-
----
 
 ## 📄 License
 
 MIT
-
----
-
-## 🔗 Links
-
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent)
-- [Hermes Agent Docs](https://hermes-agent.nousresearch.com/docs)
