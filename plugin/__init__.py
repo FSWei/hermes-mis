@@ -739,7 +739,6 @@ MIS_MEMORY_SCHEMA = {
         "ACTIONS:\n"
         "- check: validate content before writing to memory/user\n"
         "- search: keyword search across active + archive layers\n"
-        "- promote: restore an archived entry to MEMORY.md\n"
         "- status: show memory usage and archive stats\n"
         "- archive: manually archive an active entry\n\n"
         "WORKFLOW for writing:\n"
@@ -752,8 +751,8 @@ MIS_MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["check", "search", "promote", "status", "archive"],
-                "description": "check: validate. search: cross-layer search. promote: restore from archive. status: stats. archive: manual archive.",
+                "enum": ["check", "search", "status", "archive"],
+                "description": "check: validate. search: cross-layer search. status: stats. archive: manual archive.",
             },
             "content": {
                 "type": "string",
@@ -872,7 +871,7 @@ class MISProvider(MemoryProvider):
             f"- Format: §name：see skill xxx\n"
             f"- Overflow → auto-archived (not lost)\n"
             f"- ⚠️ BEFORE writing: call mis(action='check', content=..., target=...) to validate\n"
-            f"- Tools: mis (check/search/promote/status/archive), memory (write)"
+            f"- Tools: mis (check/search/status/archive), memory (write)"
         )
 
         # 2. Pending write failure warning
@@ -1061,8 +1060,6 @@ class MISProvider(MemoryProvider):
                 return self._handle_mis_check(args)
             elif action == "search":
                 return self._handle_search(args)
-            elif action == "promote":
-                return self._handle_promote(args, state)
             elif action == "status":
                 return self._handle_status(state)
             elif action == "archive":
@@ -1077,8 +1074,6 @@ class MISProvider(MemoryProvider):
         # New operations
         if action == "search":
             return self._handle_search(args)
-        elif action == "promote":
-            return self._handle_promote(args, state)
         elif action == "status":
             return self._handle_status(state)
         elif action == "archive":
