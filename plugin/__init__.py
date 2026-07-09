@@ -733,36 +733,47 @@ class MISMemoryStore(MemoryStore):
 # ---------------------------------------------------------------------------
 
 MIS_MEMORY_SCHEMA = {
-    "name": "mis_check",
+    "name": "mis",
     "description": (
-        "MIS write validator. Call BEFORE writing to memory or user profile.\n"
-        "Checks content against MIS policy (format, length, structure).\n"
-        "Returns pass/fail with explanation.\n\n"
-        "WORKFLOW:\n"
-        "1. Call mis_check(content=..., target='memory') to validate\n"
-        "2. If pass → proceed with memory(action='add', content=...)\n"
-        "3. If fail → shorten to ≤150 chars or create a Skill\n\n"
-        "POLICY:\n"
-        "- Max 150 chars per entry\n"
-        "- Format: §项目名：详见 skill xxx\n"
-        "- No structured content (lists, steps, tables)\n"
-        "- No project details (IP, ports, tech stack)\n"
-        "- Short entries (<50 chars) always pass"
+        "MIS (Memory-Index-Skill) management tool.\n\n"
+        "ACTIONS:\n"
+        "- check: validate content before writing to memory/user\n"
+        "- search: keyword search across active + archive layers\n"
+        "- promote: restore an archived entry to MEMORY.md\n"
+        "- status: show memory usage and archive stats\n"
+        "- archive: manually archive an active entry\n\n"
+        "WORKFLOW for writing:\n"
+        "1. Call mis(action='check', content='...', target='memory')\n"
+        "2. If pass → memory(action='add', content='...')\n"
+        "3. If fail → shorten to ≤150 chars or create a Skill"
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["check", "search", "promote", "status", "archive"],
+                "description": "check: validate. search: cross-layer search. promote: restore from archive. status: stats. archive: manual archive.",
+            },
             "content": {
                 "type": "string",
-                "description": "The content you plan to write to memory/user.",
+                "description": "Content to validate (for 'check' action).",
             },
             "target": {
                 "type": "string",
                 "enum": ["memory", "user"],
                 "description": "'memory' for notes, 'user' for user profile.",
             },
+            "keyword": {
+                "type": "string",
+                "description": "Search keyword (for 'search' action).",
+            },
+            "old_text": {
+                "type": "string",
+                "description": "Substring to match (for 'promote' and 'archive' actions).",
+            },
         },
-        "required": ["content"],
+        "required": ["action"],
     },
 }
 
@@ -860,8 +871,8 @@ class MISProvider(MemoryProvider):
             f"- Memory/User stores SHORT indexes only (max {max_len} chars)\n"
             f"- Format: §name：see skill xxx\n"
             f"- Overflow → auto-archived (not lost)\n"
-            f"- ⚠️ BEFORE writing: call mis_check(content=..., target=...) to validate\n"
-            f"- Tools: mis_check (validate), memory (write)"
+            f"- ⚠️ BEFORE writing: call mis(action='check', content=..., target=...) to validate\n"
+            f"- Tools: mis (check/search/promote/status/archive), memory (write)"
         )
 
         # 2. Pending write failure warning
@@ -1041,10 +1052,24 @@ class MISProvider(MemoryProvider):
     # -- Tool call dispatch -------------------------------------------------
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        # mis_check: validation-only tool (no write)
-        if tool_name == "mis_check":
-            return self._handle_mis_check(args)
+        # mis tool: multi-action (check/search/promote/status/archive)
+        if tool_name == "mis":
+            action = args.get("action", "")
+            session_id = kwargs.get("session_id", "")
+            state = self._get_state(session_id)
+            if action == "check":
+                return self._handle_mis_check(args)
+            elif action == "search":
+                return self._handle_search(args)
+            elif action == "promote":
+                return self._handle_promote(args, state)
+            elif action == "status":
+                return self._handle_status(state)
+            elif action == "archive":
+                return self._handle_archive(args)
+            return json.dumps({"success": False, "error": f"Unknown mis action: {action}"})
 
+        # Legacy: if somehow called with old tool name, handle memory actions
         action = args.get("action", "")
         session_id = kwargs.get("session_id", "")
         state = self._get_state(session_id)
