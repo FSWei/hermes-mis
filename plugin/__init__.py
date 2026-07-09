@@ -356,7 +356,7 @@ class _ArchiveManager:
             new_entry = f"\n[{timestamp}] {entry}\n"
             self.archive_file.write_text(existing + new_entry, encoding="utf-8")
 
-            # Check size limit (50KB)
+            # Check size limit (500KB)
             self._check_size()
             return True
         except Exception as e:
@@ -428,11 +428,11 @@ class _ArchiveManager:
         return 0
 
     def _check_size(self):
-        """Compress old entries if archive exceeds 50KB."""
+        """Compress old entries if archive exceeds 500KB."""
         if not self.archive_file.exists():
             return
         size = self.archive_file.stat().st_size
-        if size <= 50 * 1024:
+        if size <= 500 * 1024:
             return
         try:
             content = self.archive_file.read_text(encoding="utf-8")
@@ -471,6 +471,227 @@ class _ArchiveManager:
 
 
 # ---------------------------------------------------------------------------
+# User Archive Manager (Layer 2 for user profile)
+# ---------------------------------------------------------------------------
+
+class _UserArchiveManager:
+    """Manages the user-archive skill (Layer 2 for user profile entries)."""
+
+    def __init__(self):
+        self._archive_dir: Optional[Path] = None
+        self._archive_file: Optional[Path] = None
+
+    @property
+    def archive_dir(self) -> Path:
+        if self._archive_dir is None:
+            self._archive_dir = get_hermes_home() / "skills" / "user-archive"
+        return self._archive_dir
+
+    @property
+    def archive_file(self) -> Path:
+        if self._archive_file is None:
+            self._archive_file = self.archive_dir / "references" / "user-entries.md"
+        return self._archive_file
+
+    def exists(self) -> bool:
+        return self.archive_dir.exists() and self.archive_file.exists()
+
+    def ensure_structure(self):
+        if self.exists():
+            return
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        (self.archive_dir / "references").mkdir(exist_ok=True)
+        skill_md = (
+            "---\n"
+            "name: user-archive\n"
+            "description: >\n"
+            "  Deprecated user profile entries auto-archived by MIS.\n"
+            "  Weekly cron classifies entries into fsw-identity skill.\n"
+            "  Entries older than 30 days auto-sink to deep-archive.\n"
+            "tags: [memory, archive, mis, user]\n"
+            "---\n\n"
+            "# User Archive\n\n"
+            "> Auto-managed by MIS plugin. Do not edit directly.\n\n"
+            "## Content\n\n"
+            "See `references/user-entries.md`\n"
+        )
+        (self.archive_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+        self.archive_file.write_text(
+            "# Archived User Profile Entries\n\n", encoding="utf-8"
+        )
+
+    def append_entry(self, entry: str) -> bool:
+        try:
+            self.ensure_structure()
+            existing = self.archive_file.read_text(encoding="utf-8") if self.archive_file.exists() else ""
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            new_entry = f"\n[{timestamp}] {entry}\n"
+            self.archive_file.write_text(existing + new_entry, encoding="utf-8")
+            return True
+        except Exception as e:
+            logger.error("MIS: user-archive append failed: %s", e)
+            return False
+
+    def read_entries(self) -> List[str]:
+        try:
+            if not self.archive_file.exists():
+                return []
+            content = self.archive_file.read_text(encoding="utf-8")
+            entries = []
+            for line in content.split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and not line.startswith(">"):
+                    entries.append(line)
+            return entries
+        except Exception:
+            return []
+
+    def remove_entry(self, entry: str) -> bool:
+        try:
+            if not self.archive_file.exists():
+                return False
+            content = self.archive_file.read_text(encoding="utf-8")
+            lines = content.split("\n")
+            new_lines = []
+            removed = False
+            for line in lines:
+                if not removed and entry.strip() in line and line.strip().startswith("["):
+                    removed = True
+                    continue
+                new_lines.append(line)
+            if removed:
+                self.archive_file.write_text("\n".join(new_lines), encoding="utf-8")
+            return removed
+        except Exception:
+            return False
+
+    def count_entries(self) -> int:
+        return len(self.read_entries())
+
+    def _check_size(self):
+        """Compress old entries if user-archive exceeds 500KB."""
+        if not self.archive_file.exists():
+            return
+        size = self.archive_file.stat().st_size
+        if size <= 500 * 1024:
+            return
+        try:
+            content = self.archive_file.read_text(encoding="utf-8")
+            lines = content.split("\n")
+            cutoff = datetime.now().strftime("%Y-%m-%d")
+            header_lines = []
+            recent_lines = []
+            old_count = 0
+            in_header = True
+            for line in lines:
+                if in_header and (line.startswith("[") and re.match(r'\[\d{4}-', line)):
+                    in_header = False
+                if in_header:
+                    header_lines.append(line)
+                    continue
+                date_match = re.match(r'\[(\d{4}-\d{2}-\d{2})', line)
+                if date_match:
+                    entry_date = date_match.group(1)
+                    days_old = (datetime.now() - datetime.strptime(entry_date, "%Y-%m-%d")).days
+                    if days_old <= 30:
+                        recent_lines.append(line)
+                    else:
+                        old_count += 1
+                else:
+                    recent_lines.append(line)
+            if old_count > 0:
+                summary = f"\n[{cutoff}] [{old_count} older entries compressed]\n"
+                new_content = "\n".join(header_lines) + summary + "\n".join(recent_lines)
+                self.archive_file.write_text(new_content, encoding="utf-8")
+                logger.info("MIS: compressed %d old user-archive entries", old_count)
+        except Exception as e:
+            logger.error("MIS: user-archive compression failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+
+class _DeepArchiveManager:
+    """Manages the deep-archive skill (Layer 3 — permanent storage).
+    
+    Entries that LLM has classified go to their target skill.
+    Entries that don't match any skill sink here after 30 days.
+    This file is write-once, never modified, never re-distilled.
+    """
+
+    def __init__(self):
+        self._archive_dir: Optional[Path] = None
+        self._archive_file: Optional[Path] = None
+
+    @property
+    def archive_dir(self) -> Path:
+        if self._archive_dir is None:
+            self._archive_dir = get_hermes_home() / "skills" / "deep-archive"
+        return self._archive_dir
+
+    @property
+    def archive_file(self) -> Path:
+        if self._archive_file is None:
+            self._archive_file = self.archive_dir / "references" / "archived-entries.md"
+        return self._archive_file
+
+    def exists(self) -> bool:
+        return self.archive_dir.exists() and self.archive_file.exists()
+
+    def ensure_structure(self):
+        if self.exists():
+            return
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        (self.archive_dir / "references").mkdir(exist_ok=True)
+        skill_md = (
+            "---\n"
+            "name: deep-archive\n"
+            "description: >\n"
+            "  Permanent archive for memory/user entries.\n"
+            "  Write-once storage. Never re-processed, never re-distilled.\n"
+            "tags: [memory, archive, mis, permanent]\n"
+            "---\n\n"
+            "# Deep Archive (Permanent)\n\n"
+            "> Auto-managed by MIS plugin. Write-once, never modified.\n\n"
+            "## Content\n\n"
+            "See `references/archived-entries.md`\n"
+        )
+        (self.archive_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+        self.archive_file.write_text(
+            "# Deep Archive — Permanent Storage\n\n", encoding="utf-8"
+        )
+
+    def append_entry(self, entry: str, source: str = "memory") -> bool:
+        """Append entry permanently. source: 'memory' or 'user'."""
+        try:
+            self.ensure_structure()
+            existing = self.archive_file.read_text(encoding="utf-8") if self.archive_file.exists() else ""
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            new_entry = f"\n[{timestamp}] [{source}] {entry}\n"
+            self.archive_file.write_text(existing + new_entry, encoding="utf-8")
+            return True
+        except Exception as e:
+            logger.error("MIS: deep-archive append failed: %s", e)
+            return False
+
+    def read_entries(self) -> List[str]:
+        try:
+            if not self.archive_file.exists():
+                return []
+            content = self.archive_file.read_text(encoding="utf-8")
+            entries = []
+            for line in content.split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and not line.startswith(">"):
+                    entries.append(line)
+            return entries
+        except Exception:
+            return []
+
+    def count_entries(self) -> int:
+        return len(self.read_entries())
+
+
+# ---------------------------------------------------------------------------
 # MIS MemoryStore (enhanced)
 # ---------------------------------------------------------------------------
 
@@ -478,21 +699,21 @@ class MISMemoryStore(MemoryStore):
     """MemoryStore subclass with MIS policy enforcement."""
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
-        if target == "memory":
+        if target in ("memory", "user"):
             violation = _check_mis_policy(content, self)
             if violation:
                 return {"success": False, "error": violation}
         return super().add(target, content)
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
-        if target == "memory":
+        if target in ("memory", "user"):
             violation = _check_mis_policy(new_content, self)
             if violation:
                 return {"success": False, "error": violation}
         return super().replace(target, old_text, new_content)
 
     def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
-        if target == "memory":
+        if target in ("memory", "user"):
             for i, op in enumerate(operations):
                 op = op or {}
                 act = op.get("action")
@@ -604,6 +825,8 @@ class MISProvider(MemoryProvider):
         self._session_states: Dict[str, _SessionState] = {}
         self._state_lock = threading.Lock()
         self._archive = _ArchiveManager()
+        self._user_archive = _UserArchiveManager()
+        self._deep_archive = _DeepArchiveManager()
         self._violations_cache: List[Dict[str, str]] = []
 
     # -- State management ---------------------------------------------------
@@ -669,7 +892,7 @@ class MISProvider(MemoryProvider):
         # 1. Strategy (compact, ~50 tokens)
         parts.append(
             f"MEMORY STRATEGY: MIS (Memory-Index-Skill)\n"
-            f"- Memory stores SHORT indexes only (max {max_len} chars)\n"
+            f"- Memory/User stores SHORT indexes only (max {max_len} chars)\n"
             f"- Format: §name：see skill xxx\n"
             f"- Overflow → auto-archived (not lost)\n"
             f"- Tools: memory(action='search/promote/status/archive')"
@@ -679,26 +902,39 @@ class MISProvider(MemoryProvider):
         pending = state.pending_write_failure
         if pending:
             turns_ago = state.current_turn - pending.get("turn", 0)
+            pending_target = pending.get("target", "memory")
             parts.append(
-                f"\n⚠️ [MIS] Unsaved memory from {turns_ago} turns ago:\n"
+                f"\n⚠️ [MIS] Unsaved {pending_target} write from {turns_ago} turns ago:\n"
                 f"  \"{pending['content'][:80]}\"\n"
                 f"  It will be auto-archived at session end."
             )
 
-        # 3. Archive summary
+        # 3. Archive summary (memory + user + deep)
         archive_count = self._archive.count_entries()
+        user_archive_count = self._user_archive.count_entries()
+        deep_count = self._deep_archive.count_entries()
+        archive_parts = []
         if archive_count > 0:
-            topics = self._archive.get_topics(max_topics=6)
+            topics = self._archive.get_topics(max_topics=4)
+            archive_parts.append(f"memory: {archive_count} ({topics})")
+        if user_archive_count > 0:
+            archive_parts.append(f"user: {user_archive_count}")
+        if deep_count > 0:
+            archive_parts.append(f"deep: {deep_count}")
+        if archive_parts:
             parts.append(
-                f"\n📦 [Archive] {archive_count} entries: {topics}\n"
+                f"\n📦 [Archive] {'; '.join(archive_parts)}\n"
                 f"  memory(action='search', keyword='...') to find"
             )
 
-        # 4. Capacity warning
+        # 4. Capacity warnings
         if self._store:
-            ratio = self._store._char_count("memory") / self._store._char_limit("memory")
-            if ratio > 0.85:
-                parts.append(f"\n⚡ [MIS] Memory at {ratio:.0%}")
+            mem_ratio = self._store._char_count("memory") / self._store._char_limit("memory")
+            user_ratio = self._store._char_count("user") / self._store._char_limit("user")
+            if mem_ratio > 0.85:
+                parts.append(f"\n⚡ [MIS] Memory at {mem_ratio:.0%}")
+            if user_ratio > 0.85:
+                parts.append(f"\n⚡ [MIS] User at {user_ratio:.0%}")
 
         return "\n".join(parts)
 
@@ -773,10 +1009,10 @@ class MISProvider(MemoryProvider):
 
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:
-        if target == "memory" and action in {"add", "replace"}:
+        if target in ("memory", "user") and action in {"add", "replace"}:
             violation = _check_mis_policy(content, self._store)
             if violation:
-                logger.warning("MIS violation in on_memory_write (%s): %s", action, violation[:200])
+                logger.warning("MIS violation in on_memory_write (%s/%s): %s", target, action, violation[:200])
 
     # -- Session lifecycle hooks --------------------------------------------
 
@@ -789,10 +1025,12 @@ class MISProvider(MemoryProvider):
             old_state = self._get_state(old_id)
             pending = old_state.pending_write_failure
             if pending and pending.get("content"):
-                archived = self._archive.append_entry(pending["content"])
+                pending_target = pending.get("target", "memory")
+                archive_mgr = self._user_archive if pending_target == "user" else self._archive
+                archived = archive_mgr.append_entry(pending["content"])
                 if archived:
-                    self._leave_archive_reference(pending["content"])
-                    logger.info("MIS: migrated pending write to archive on session switch")
+                    self._leave_archive_reference(pending["content"], pending_target)
+                    logger.info("MIS: migrated pending %s write to archive on session switch", pending_target)
                 old_state.pending_write_failure = None
 
             # Cleanup old session state
@@ -808,10 +1046,12 @@ class MISProvider(MemoryProvider):
         # 1. Force-archive pending writes
         pending = state.pending_write_failure
         if pending and pending.get("content"):
-            archived = self._archive.append_entry(pending["content"])
+            pending_target = pending.get("target", "memory")
+            archive_mgr = self._user_archive if pending_target == "user" else self._archive
+            archived = archive_mgr.append_entry(pending["content"])
             if archived:
-                self._leave_archive_reference(pending["content"])
-                logger.info("MIS: force-archived pending write at session end")
+                self._leave_archive_reference(pending["content"], pending_target)
+                logger.info("MIS: force-archived pending %s write at session end", pending_target)
             state.pending_write_failure = None
 
         # 2. Maintenance scan (log only, no auto-action)
@@ -885,35 +1125,32 @@ class MISProvider(MemoryProvider):
         if not content:
             return json.dumps({"success": False, "error": "content required for add"})
 
-        # User profile — pass through
-        if target != "memory":
-            result = self._store.add(target, content)
-            return json.dumps(result, ensure_ascii=False)
-
-        # Policy check
+        # Policy check (both memory and user)
         violation = _check_mis_policy(content, self._store)
         if violation:
             return json.dumps({"success": False, "error": violation}, ensure_ascii=False)
 
         # Try write
-        result = self._store.add("memory", content)
+        result = self._store.add(target, content)
 
         # Success
         if result.get("success"):
             state.pending_write_failure = None
             return json.dumps(result, ensure_ascii=False)
 
-        # Capacity overflow → auto-archive
+        # Capacity overflow → auto-archive (memory or user)
         if "limit" in str(result.get("error", "")):
-            archived = self._archive.append_entry(content)
+            archive_mgr = self._user_archive if target == "user" else self._archive
+            archived = archive_mgr.append_entry(content)
             if archived:
-                self._leave_archive_reference(content)
+                self._leave_archive_reference(content, target)
                 state.pending_write_failure = None
+                layer_name = "user-archive" if target == "user" else "memory-archive"
                 return json.dumps({
                     "success": True,
                     "archived": True,
-                    "message": "[MIS] Entry auto-archived (MEMORY.md full). "
-                               "Use memory(action='search') to find it.",
+                    "message": f"[MIS] Entry auto-archived ({target} full). "
+                               f"Use memory(action='search') to find it.",
                 }, ensure_ascii=False)
 
             # Archive also failed → persist failure state
@@ -921,10 +1158,11 @@ class MISProvider(MemoryProvider):
                 "content": content[:300],
                 "error": "archive_failed",
                 "turn": state.current_turn,
+                "target": target,
             }
             return json.dumps({
                 "success": False,
-                "error": "Both MEMORY.md and archive write failed. "
+                "error": f"Both {target} and archive write failed. "
                          "Data preserved in conversation history. "
                          "Will be auto-archived at session end.",
             }, ensure_ascii=False)
@@ -955,7 +1193,7 @@ class MISProvider(MemoryProvider):
         return json.dumps(result, ensure_ascii=False)
 
     def _handle_search(self, args: Dict) -> str:
-        """Cross-layer search: MEMORY.md + archive."""
+        """Cross-layer search: MEMORY.md + USER.md + memory-archive + user-archive."""
         keyword = args.get("keyword", "").strip()
         if not keyword:
             return json.dumps({"success": False, "error": "keyword required"})
@@ -963,15 +1201,25 @@ class MISProvider(MemoryProvider):
         results = []
         keyword_lower = keyword.lower()
 
-        # Search active
+        # Search active memory
         for entry in self._store._entries_for("memory"):
             if keyword_lower in entry.lower():
-                results.append({"layer": "active", "entry": entry})
+                results.append({"layer": "active", "target": "memory", "entry": entry})
 
-        # Search archive
+        # Search active user
+        for entry in self._store._entries_for("user"):
+            if keyword_lower in entry.lower():
+                results.append({"layer": "active", "target": "user", "entry": entry})
+
+        # Search memory-archive
         for entry in self._archive.read_entries():
             if keyword_lower in entry.lower():
-                results.append({"layer": "archive", "entry": entry})
+                results.append({"layer": "archive", "target": "memory", "entry": entry})
+
+        # Search user-archive
+        for entry in self._user_archive.read_entries():
+            if keyword_lower in entry.lower():
+                results.append({"layer": "archive", "target": "user", "entry": entry})
 
         return json.dumps({
             "success": True,
@@ -1024,34 +1272,50 @@ class MISProvider(MemoryProvider):
         return json.dumps(result, ensure_ascii=False)
 
     def _handle_status(self, state: _SessionState) -> str:
-        active = self._store._entries_for("memory")
-        active_chars = self._store._char_count("memory")
-        active_limit = self._store._char_limit("memory")
+        active_mem = self._store._entries_for("memory")
+        active_mem_chars = self._store._char_count("memory")
+        active_mem_limit = self._store._char_limit("memory")
+        active_user = self._store._entries_for("user")
+        active_user_chars = self._store._char_count("user")
+        active_user_limit = self._store._char_limit("user")
         archive_count = self._archive.count_entries()
         archive_size = self._archive.get_file_size()
+        user_archive_count = self._user_archive.count_entries()
+        deep_count = self._deep_archive.count_entries()
 
         return json.dumps({
             "success": True,
-            "active": {
-                "entries": len(active),
-                "chars": active_chars,
-                "limit": active_limit,
-                "usage_pct": round(active_chars / active_limit * 100, 1) if active_limit else 0,
+            "memory": {
+                "entries": len(active_mem),
+                "chars": active_mem_chars,
+                "limit": active_mem_limit,
+                "usage_pct": round(active_mem_chars / active_mem_limit * 100, 1) if active_mem_limit else 0,
+            },
+            "user": {
+                "entries": len(active_user),
+                "chars": active_user_chars,
+                "limit": active_user_limit,
+                "usage_pct": round(active_user_chars / active_user_limit * 100, 1) if active_user_limit else 0,
             },
             "archive": {
-                "entries": archive_count,
+                "memory_entries": archive_count,
+                "user_entries": user_archive_count,
                 "size_kb": round(archive_size / 1024, 1),
+            },
+            "deep_archive": {
+                "entries": deep_count,
             },
             "pending_write_failure": state.pending_write_failure is not None,
         }, ensure_ascii=False)
 
     def _handle_archive(self, args: Dict) -> str:
-        """Manually archive a MEMORY.md entry."""
+        """Manually archive an active entry."""
         old_text = args.get("old_text", "").strip()
+        target = args.get("target", "memory")
         if not old_text:
             return json.dumps({"success": False, "error": "old_text required"})
 
-        entries = self._store._entries_for("memory")
+        entries = self._store._entries_for(target)
         matched = [e for e in entries if old_text.lower() in e.lower()]
         if not matched:
             return json.dumps({"success": False, "error": f"No match for: {old_text}"})
@@ -1063,9 +1327,10 @@ class MISProvider(MemoryProvider):
                 "error": "P0 entries (core preferences) cannot be archived"
             })
 
-        self._store.remove("memory", entry)
-        self._archive.append_entry(entry)
-        self._leave_archive_reference(entry)
+        archive_mgr = self._user_archive if target == "user" else self._archive
+        self._store.remove(target, entry)
+        archive_mgr.append_entry(entry)
+        self._leave_archive_reference(entry, target)
         return json.dumps({"success": True, "archived": entry[:80]}, ensure_ascii=False)
 
     # -- Internal helpers ---------------------------------------------------
@@ -1082,28 +1347,30 @@ class MISProvider(MemoryProvider):
                 }
 
     def _check_capacity(self, state: _SessionState):
-        """Auto-evict when memory exceeds 95%."""
-        ratio = self._store._char_count("memory") / self._store._char_limit("memory")
-        if ratio > 0.95:
-            self._auto_evict(state, target_ratio=0.85)
+        """Auto-evict when memory or user exceeds 95%."""
+        for target in ("memory", "user"):
+            ratio = self._store._char_count(target) / self._store._char_limit(target)
+            if ratio > 0.95:
+                self._auto_evict(state, target=target, target_ratio=0.85)
 
-    def _auto_evict(self, state: _SessionState, target_ratio: float = 0.85):
+    def _auto_evict(self, state: _SessionState, target: str = "memory", target_ratio: float = 0.85):
         """Evict low-priority entries to archive."""
-        entries = self._store._entries_for("memory")
+        entries = self._store._entries_for(target)
         ranked = sorted(entries, key=lambda e: (
             _priority_rank(e),
             self._get_last_accessed_rank(e, state),
         ))
 
-        target_chars = int(self._store._char_limit("memory") * target_ratio)
+        target_chars = int(self._store._char_limit(target) * target_ratio)
+        archive_mgr = self._user_archive if target == "user" else self._archive
         for entry in ranked:
             if _classify_priority(entry) == "P0":
                 break
-            if self._store._char_count("memory") <= target_chars:
+            if self._store._char_count(target) <= target_chars:
                 break
-            self._store.remove("memory", entry)
-            self._archive.append_entry(entry)
-            logger.info("MIS: auto-evicted entry (%d chars)", len(entry))
+            self._store.remove(target, entry)
+            archive_mgr.append_entry(entry)
+            logger.info("MIS: auto-evicted %s entry (%d chars)", target, len(entry))
 
     def _force_evict_for_space(self, needed_chars: int) -> bool:
         """Precisely evict entries to make room (for promote)."""
@@ -1129,15 +1396,15 @@ class MISProvider(MemoryProvider):
             return -int(log.get("count", 0))
         return 0
 
-    def _leave_archive_reference(self, entry: str):
-        """Leave a reference line in MEMORY.md after archiving."""
+    def _leave_archive_reference(self, entry: str, target: str = "memory"):
+        """Leave a reference line in active layer after archiving."""
         topic = re.sub(r'^§\s*', '', entry)
         topic = re.sub(r'[：:].*$', '', topic).strip()[:25]
-        ref_line = f"§[归档] {topic}：详见 memory-archive"
-        current = self._store._char_count("memory")
-        limit = self._store._char_limit("memory")
+        ref_line = f"§[归档] {topic}：详见 {'user' if target == 'user' else ''}memory-archive"
+        current = self._store._char_count(target)
+        limit = self._store._char_limit(target)
         if current + len(ref_line) < limit * 0.93:
-            self._store.add("memory", ref_line)
+            self._store.add(target, ref_line)
 
     def _find_stale_entries(self, days: int = 14) -> List[str]:
         """Find entries not accessed in N days (session-local tracking)."""
