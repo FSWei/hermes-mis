@@ -1,47 +1,48 @@
-# Hermes MIS v2 (Memory-Index-Skill)
+# Hermes MIS v3 (Memory-Index-Skill)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Hermes Agent](https://img.shields.io/badge/Hermes-Agent-blue.svg)](https://github.com/NousResearch/hermes-agent)
 
-**Hermes Agent 双层记忆管理引擎 — 活跃层 + 归档层，自动归档、跨层搜索、访问追踪、写入回退。**
+**Hermes Agent 三层记忆管理引擎 — 活跃层 → 归档层 → 深度归档，代码级写入验证。**
 
 [English](README.md)
 
 ---
 
-## 🎯 MIS v2 是什么？
+## 🎯 MIS v3 是什么？
 
-MIS 是 Hermes MemoryProvider 插件，把默认的扁平记忆系统升级为双层架构：
+MIS 是 Hermes MemoryProvider 插件，把默认的扁平记忆系统升级为三层架构：
 
-### Layer 1: 活跃层（MEMORY.md）
-- 每轮注入系统 prompt（~2,200 字符）
+### Layer 1: 活跃层（MEMORY.md / USER.md）
+- 每轮注入系统 prompt
 - 只存短索引行：`§项目名：详见 skill xxx`
-- 代码级写入验证（格式、长度、结构、死引用）
+- **`mis_check` 工具**在写入前验证（代码级，非 prompt 级）
+- 支持 `memory` 和 `user` 双目标拦截
 
-### Layer 2: 归档层（memory-archive skill）
-- 首次淘汰时自动创建
-- 带时间戳的归档条目，可通过 `memory(action='search')` 搜索
-- 通过 `memory(action='promote')` 恢复
-- 50KB 软限制，自动压缩旧条目
+### Layer 2: 归档层（memory-archive / user-archive）
+- 溢出自动归档，带时间戳
+- 每周 LLM 分类 cron，归位到正确的 Skill
+- 跨层搜索（4 层：active memory + user + archive + user-archive）
+
+### Layer 3: 深度归档（deep-archive）
+- 永久存储，write-once，不再处理
+- 30 天未归位的条目自动下沉
 
 ---
 
-## ✨ v2 新特性
+## ✨ v3 新特性
 
 | 特性 | 说明 |
 |------|------|
+| **mis_check 工具** | 写入前验证，绕过核心工具名冲突 |
+| **User 目标拦截** | memory 和 user 都走 MIS 策略检查 |
+| **三层归档流水线** | Active → Archive → Deep Archive |
+| **每周分类 cron** | LLM 自动将归档条目归位到正确 Skill |
+| **30 天自动下沉** | 时间驱动，不依赖 LLM 判断 |
 | **自动归档** | 溢出条目透明归档（不报错） |
-| **跨层搜索** | `memory(action='search', keyword='...')` 同时搜索两层 |
-| **归档恢复** | `memory(action='promote', old_text='...')` 从归档恢复 |
-| **状态查询** | `memory(action='status')` 查看容量统计 |
-| **手动归档** | `memory(action='archive', old_text='...')` 手动归档 |
-| **写入回退** | 四级回退链，数据永不丢失 |
-| **访问追踪** | 关键词匹配，per-session，无 LLM 调用 |
-| **优先级淘汰** | P0（核心）→ P1（环境）→ P2（项目）→ P3（临时） |
-| **死引用检测** | 检测引用不存在的 skill |
-| **并发安全** | per-session 状态，支持 gateway 多 session |
-| **压缩前保存** | 上下文压缩前提取关键信息 |
-| **对话事实标记** | 扫描对话中的记忆关键词 |
+| **跨层搜索** | 4 层搜索（memory + user + 两个 archive） |
+| **优先级淘汰** | P0（核心）→ P3（临时） |
+| **并发安全** | per-session 状态，gateway 多 session 安全 |
 
 ---
 
@@ -56,26 +57,36 @@ hermes plugins enable mis
 hermes memory provider mis
 ```
 
+配置 `~/.hermes/config.yaml`：
+```yaml
+memory:
+  provider: mis
+  memory_char_limit: 2200
+  user_char_limit: 1375
+```
+
+验证：`hermes memory status` → 应显示 `Provider: mis ← active`
+
 ---
 
 ## 📖 使用
 
-### 标准操作（向后兼容）
+### mis_check 工作流
 
-```python
-memory(action='add', target='memory', content='§项目：详见 skill my-project')
-memory(action='replace', target='memory', old_text='旧内容', content='新内容')
-memory(action='remove', target='memory', old_text='要删除的内容')
+写入前先验证：
+```
+mis_check(content="...", target="memory")  → PASS/FAIL
+  ↓ PASS
+memory(action='add', content="...")
 ```
 
-### v2 新操作
+### Cron 脚本
 
-```python
-memory(action='search', keyword='distillyourself')     # 跨层搜索
-memory(action='promote', old_text='distillyourself')    # 恢复归档
-memory(action='status')                                 # 状态查询
-memory(action='archive', old_text='旧项目')              # 手动归档
+```bash
+cp scripts/archive-classify.py ~/.hermes/profiles/<profile>/scripts/
 ```
+
+创建每周 cron job（周一 03:00），自动分类归档条目到 Skill 或深度归档。
 
 ---
 
