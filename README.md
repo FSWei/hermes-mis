@@ -1,4 +1,4 @@
-# Hermes MIS v2 (Memory-Index-Skill)
+# Hermes MIS v3 (Memory-Index-Skill)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Hermes Agent](https://img.shields.io/badge/Hermes-Agent-blue.svg)](https://github.com/NousResearch/hermes-agent)
@@ -28,7 +28,7 @@ MIS is a Hermes MemoryProvider plugin that replaces the default flat memory syst
 
 ---
 
-## ✨ v2 Features
+## ✨ v3 Features
 
 | Feature | Description |
 |---------|-------------|
@@ -44,8 +44,27 @@ MIS is a Hermes MemoryProvider plugin that replaces the default flat memory syst
 | **Concurrency safe** | Per-session state for gateway multi-session |
 | **Pre-compress save** | Extracts key info before context compression |
 | **Fact detection** | Scans conversation for memory-worthy content |
+| **mis\_check tool** | Validates content before writing (bypasses core tool conflict) |
+| **3-layer archive** | Active → Archive → Deep Archive with weekly LLM classification |
+| **User profile interception** | MIS validates both memory and user target writes |
 
 ---
+
+### Weekly Archive Classification (Cron)
+
+MIS includes a cron script for automated archive classification:
+
+```bash
+# Install the cron script
+cp scripts/archive-classify.py ~/.hermes/profiles/<profile>/scripts/
+
+# Register as a weekly cron job (via agent or CLI)
+# Runs every Monday at 03:00
+# Classifies archived entries into skills or deep-archive
+```
+
+The script outputs structured JSON (archive entries + skill index) for the agent to classify. Entries older than 30 days auto-sink to deep-archive (permanent, never re-processed).
+
 
 ## 🚀 Quick Install
 
