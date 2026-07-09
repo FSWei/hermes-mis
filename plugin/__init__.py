@@ -733,71 +733,36 @@ class MISMemoryStore(MemoryStore):
 # ---------------------------------------------------------------------------
 
 MIS_MEMORY_SCHEMA = {
-    "name": "memory",
+    "name": "mis_check",
     "description": (
-        "Save durable facts to persistent memory that survive across sessions. Memory is "
-        "injected into every future turn, so keep entries compact and high-signal.\n\n"
-        "MIS POLICY (enforced at code level):\n"
-        "- Memory stores SHORT INDEXES ONLY. Max 150 chars per entry.\n"
+        "MIS write validator. Call BEFORE writing to memory or user profile.\n"
+        "Checks content against MIS policy (format, length, structure).\n"
+        "Returns pass/fail with explanation.\n\n"
+        "WORKFLOW:\n"
+        "1. Call mis_check(content=..., target='memory') to validate\n"
+        "2. If pass → proceed with memory(action='add', content=...)\n"
+        "3. If fail → shorten to ≤150 chars or create a Skill\n\n"
+        "POLICY:\n"
+        "- Max 150 chars per entry\n"
         "- Format: §项目名：详见 skill xxx\n"
-        "- Overflow → auto-archived (not lost).\n\n"
-        "ACTIONS:\n"
-        "- add/replace/remove: standard memory operations\n"
-        "- search: search both MEMORY.md and archive by keyword\n"
-        "- promote: restore an archived entry to MEMORY.md\n"
-        "- status: show memory usage and archive stats\n"
-        "- archive: manually archive a MEMORY.md entry\n\n"
-        "HOW: make ALL changes in ONE call via 'operations' array for batch, "
-        "or use single action/content/old_text for one change.\n\n"
-        "TARGETS: 'memory' = your notes, 'user' = user profile.\n\n"
-        "SKIP: trivial info, raw data dumps, task progress, temporary TODO state."
+        "- No structured content (lists, steps, tables)\n"
+        "- No project details (IP, ports, tech stack)\n"
+        "- Short entries (<50 chars) always pass"
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {
+            "content": {
                 "type": "string",
-                "enum": ["add", "replace", "remove", "search", "promote", "status", "archive"],
-                "description": (
-                    "add/replace/remove: standard ops (overflow auto-archived).\n"
-                    "search: keyword search across active + archive.\n"
-                    "promote: restore archived entry to MEMORY.md.\n"
-                    "status: memory usage stats.\n"
-                    "archive: manually archive a MEMORY.md entry."
-                ),
+                "description": "The content you plan to write to memory/user.",
             },
             "target": {
                 "type": "string",
                 "enum": ["memory", "user"],
                 "description": "'memory' for notes, 'user' for user profile.",
             },
-            "content": {
-                "type": "string",
-                "description": "Entry content for add/replace.",
-            },
-            "old_text": {
-                "type": "string",
-                "description": "Substring identifying the entry for replace/remove/promote/archive.",
-            },
-            "keyword": {
-                "type": "string",
-                "description": "Search keyword for 'search' action.",
-            },
-            "operations": {
-                "type": "array",
-                "description": "Batch: list of {action, content?, old_text?} applied atomically.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-                        "content": {"type": "string"},
-                        "old_text": {"type": "string"},
-                    },
-                    "required": ["action"],
-                },
-            },
         },
-        "required": ["target"],
+        "required": ["content"],
     },
 }
 
@@ -895,7 +860,8 @@ class MISProvider(MemoryProvider):
             f"- Memory/User stores SHORT indexes only (max {max_len} chars)\n"
             f"- Format: §name：see skill xxx\n"
             f"- Overflow → auto-archived (not lost)\n"
-            f"- Tools: memory(action='search/promote/status/archive')"
+            f"- ⚠️ BEFORE writing: call mis_check(content=..., target=...) to validate\n"
+            f"- Tools: mis_check (validate), memory (write)"
         )
 
         # 2. Pending write failure warning
@@ -1075,6 +1041,10 @@ class MISProvider(MemoryProvider):
     # -- Tool call dispatch -------------------------------------------------
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        # mis_check: validation-only tool (no write)
+        if tool_name == "mis_check":
+            return self._handle_mis_check(args)
+
         action = args.get("action", "")
         session_id = kwargs.get("session_id", "")
         state = self._get_state(session_id)
@@ -1108,6 +1078,29 @@ class MISProvider(MemoryProvider):
         return json.dumps({"success": False, "error": f"Unknown action: {action}"})
 
     # -- Tool handlers ------------------------------------------------------
+
+    def _handle_mis_check(self, args: Dict) -> str:
+        """Validate content against MIS policy. No write, pure check."""
+        content = args.get("content", "").strip()
+        target = args.get("target", "memory")
+        if not content:
+            return json.dumps({"success": False, "error": "content required"}, ensure_ascii=False)
+
+        violation = _check_mis_policy(content, self._store)
+        if violation:
+            return json.dumps({
+                "success": False,
+                "blocked": True,
+                "reason": violation,
+                "hint": "Shorten to ≤150 chars, or create a Skill with skill_manage(action='create').",
+            }, ensure_ascii=False)
+
+        return json.dumps({
+            "success": True,
+            "blocked": False,
+            "chars": len(content),
+            "message": f"PASS ({len(content)} chars). Safe to write with memory(action='add').",
+        }, ensure_ascii=False)
 
     def _handle_add_enhanced(self, args: Dict, state: _SessionState) -> str:
         """Enhanced add: overflow auto-archived instead of error."""
