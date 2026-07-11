@@ -193,6 +193,179 @@ def _check_mis_policy(content: str, store=None) -> Optional[str]:
     return None
 
 
+def _check_mis_policy_v2(content: str, store=None) -> dict:
+    """Structured policy check with resolution suggestions."""
+    content = content.strip()
+    if not content:
+        return {"blocked": False}
+
+    # Index line format → always allowed
+    if _INDEX_LINE_RE.match(content):
+        dead = _find_dead_references(content)
+        if dead:
+            return {"blocked": True, "reason": "dead_reference", "detail": f"References non-existent skill(s): {', '.join(dead)}", "suggestions": [{"action": "create_skill", "hint": f"创建 Skill: {dead[0]}"}]}
+        return {"blocked": False}
+
+    # Short entries → always allowed
+    if len(content) < 50:
+        return {"blocked": False}
+
+    # Check for reference structure
+    struct_label = _check_reference_structure(content)
+    if struct_label:
+        if len(content) <= 50 and 'list' not in struct_label:
+            pass
+        else:
+            return {"blocked": True, "reason": "structured_content", "detail": f"Structured content ({struct_label}) belongs in a Skill", "suggestions": _build_suggestions(content, "structured")}
+
+    # Multi-point heuristic
+    segments = re.split(r'[、，,；;]\s*', content)
+    detail_segments = [s for s in segments if len(s) > 2]
+    if len(detail_segments) >= 3 and len(content) > 100:
+        return {"blocked": True, "reason": "too_many_points", "detail": f"{len(detail_segments)} detail points in {len(content)} chars", "suggestions": _build_suggestions(content, "too_many_points")}
+
+    # Domain-specific detail signals
+    violations = []
+    for pattern, label in _PROJECT_DETAIL_PATTERNS:
+        if pattern.search(content):
+            violations.append(label)
+    if violations and len(content) > 100:
+        return {"blocked": True, "reason": "domain_details", "detail": f"Contains project details ({', '.join(violations[:3])})", "suggestions": _build_suggestions(content, "domain_details")}
+
+    # Length check
+    max_len = _get_max_entry_length()
+    if len(content) > 200:
+        return {"blocked": True, "reason": "too_long", "detail": f"Too long ({len(content)} chars > 200)", "chars": len(content), "max": 200, "suggestions": _build_suggestions(content, "too_long")}
+    if len(content) > max_len:
+        struct = _check_reference_structure(content)
+        if struct:
+            return {"blocked": True, "reason": "long_and_structured", "detail": f"Long ({len(content)} chars) + structured ({struct})", "suggestions": _build_suggestions(content, "long_structured")}
+        # Gray zone 150-200: allowed, no rejection
+        return {"blocked": False, "gray_zone": True, "chars": len(content), "max": max_len}
+
+    return {"blocked": False}
+
+
+def _build_suggestions(content: str, reason: str) -> list:
+    """Build resolution suggestions for a policy violation."""
+    suggestions = []
+
+    # Try to match existing skill
+    skill_match = _match_skill_for_entry(content)
+    if skill_match:
+        suggestions.append({"action": "match_skill", "skill": skill_match, "hint": f"追加到已有 Skill: {skill_match}"})
+
+    # Suggest new skill name
+    new_skill = _suggest_skill_name(content)
+    if new_skill:
+        suggestions.append({"action": "create_skill", "skill": new_skill, "hint": f"创建新 Skill: {new_skill}"})
+
+    suggestions.append({"action": "shorten", "hint": f"缩短到{_get_max_entry_length()}字符以内"})
+    suggestions.append({"action": "force", "hint": "忽略限制直接写入（不推荐）"})
+
+    return suggestions
+
+
+def _match_skill_for_entry(content: str) -> Optional[str]:
+    """Try to match content to an existing skill by keywords."""
+    try:
+        skills_dir = get_hermes_home() / "skills" / "chips" / "skills"
+        if not skills_dir.exists():
+            skills_dir = get_hermes_home() / "skills"
+        if not skills_dir.exists():
+            return None
+
+        # Extract keywords from content
+        cleaned = re.sub(r'^§\s*', '', content)
+        cleaned = re.sub(r'[：:、，,`"\'.\(\)\[\]{}]', ' ', cleaned)
+        keywords = [w.lower() for w in cleaned.split() if len(w) > 2]
+
+        if not keywords:
+            return None
+
+        # Search skill names and descriptions
+        best_match = None
+        best_score = 0
+        for skill_dir in skills_dir.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            skill_name = skill_dir.name.lower()
+            score = sum(1 for kw in keywords if kw in skill_name)
+            if score > best_score:
+                best_score = score
+                best_match = skill_dir.name
+
+        return best_match if best_score >= 2 else None
+    except Exception:
+        return None
+
+
+def _suggest_skill_name(content: str) -> Optional[str]:
+    """Suggest a skill name based on content."""
+    cleaned = re.sub(r'^§\s*', '', content)
+    # Extract the topic before the colon
+    topic_match = re.match(r'([^：:]+)', cleaned)
+    if topic_match:
+        topic = topic_match.group(1).strip()
+        # Convert to lowercase-hyphenated name
+        name = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fff]+', '-', topic).strip('-').lower()
+        if len(name) > 3:
+            return name[:30]
+    return None
+
+
+def _extract_topic(content: str) -> str:
+    """Extract topic name from a §-prefixed entry."""
+    cleaned = re.sub(r'^§\s*', '', content)
+    topic_match = re.match(r'([^：:]+)', cleaned)
+    return topic_match.group(1).strip() if topic_match else content[:20]
+
+
+def _append_to_skill(skill_name: str, content: str) -> bool:
+    """Append content to an existing skill's references."""
+    try:
+        skills_dir = get_hermes_home() / "skills" / "chips" / "skills"
+        if not skills_dir.exists():
+            skills_dir = get_hermes_home() / "skills"
+        skill_dir = skills_dir / skill_name
+        if not skill_dir.exists():
+            return False
+        refs_dir = skill_dir / "references"
+        refs_dir.mkdir(exist_ok=True)
+        append_file = refs_dir / "memory-overflow.md"
+        existing = append_file.read_text(encoding="utf-8") if append_file.exists() else "# Memory Overflow\n\n"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        existing += f"\n[{timestamp}] {content}\n"
+        append_file.write_text(existing, encoding="utf-8")
+        return True
+    except Exception as e:
+        logger.error("MIS: failed to append to skill %s: %s", skill_name, e)
+        return False
+
+
+def _create_skill_from_content(skill_name: str, content: str) -> bool:
+    """Create a new skill from overflow content."""
+    try:
+        skills_dir = get_hermes_home() / "skills" / "chips" / "skills"
+        if not skills_dir.exists():
+            skills_dir = get_hermes_home() / "skills"
+        skill_dir = skills_dir / skill_name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        refs_dir = skill_dir / "references"
+        refs_dir.mkdir(exist_ok=True)
+
+        topic = _extract_topic(content)
+        skill_md = f"---\nname: {skill_name}\ndescription: Auto-created by MIS for overflow memory: {topic}\ntags: [auto-created, mis]\n---\n\n# {topic}\n\n> Auto-created by MIS. Content moved from MEMORY.md.\n\n{content}\n"
+        (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        (refs_dir / "memory-overflow.md").write_text(f"# Memory Overflow\n\n[{timestamp}] {content}\n", encoding="utf-8")
+        return True
+    except Exception as e:
+        logger.error("MIS: failed to create skill %s: %s", skill_name, e)
+        return False
+
+
 def _find_dead_references(content: str) -> List[str]:
     """Check if referenced skills exist."""
     try:
@@ -698,18 +871,52 @@ class _DeepArchiveManager:
 class MISMemoryStore(MemoryStore):
     """MemoryStore subclass with MIS policy enforcement."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pending_violations: List[Dict[str, Any]] = []
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         if target in ("memory", "user"):
-            violation = _check_mis_policy(content, self)
-            if violation:
-                return {"success": False, "error": violation}
+            result = _check_mis_policy_v2(content, self)
+            if result.get("blocked"):
+                pending_entry = {
+                    "content": content,
+                    "target": target,
+                    "action": "add",
+                    "violation": result,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                self._pending_violations.append(pending_entry)
+                return {
+                    "success": False,
+                    "error": result.get("detail", "Policy violation"),
+                    "reason": result.get("reason"),
+                    "suggestions": result.get("suggestions", []),
+                    "pending_id": len(self._pending_violations) - 1,
+                }
         return super().add(target, content)
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         if target in ("memory", "user"):
-            violation = _check_mis_policy(new_content, self)
-            if violation:
-                return {"success": False, "error": violation}
+            result = _check_mis_policy_v2(new_content, self)
+            if result.get("blocked"):
+                pending_entry = {
+                    "content": new_content,
+                    "target": target,
+                    "action": "replace",
+                    "old_text": old_text,
+                    "violation": result,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                self._pending_violations.append(pending_entry)
+                return {
+                    "success": False,
+                    "error": result.get("detail", "Policy violation"),
+                    "reason": result.get("reason"),
+                    "suggestions": result.get("suggestions", []),
+                    "pending_id": len(self._pending_violations) - 1,
+                    "old_text": old_text,
+                }
         return super().replace(target, old_text, new_content)
 
     def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -719,13 +926,91 @@ class MISMemoryStore(MemoryStore):
                 act = op.get("action")
                 content = op.get("content", "")
                 if act in {"add", "replace"} and content:
-                    violation = _check_mis_policy(content, self)
-                    if violation:
+                    result = _check_mis_policy_v2(content, self)
+                    if result.get("blocked"):
+                        pending_entry = {
+                            "content": content,
+                            "target": target,
+                            "action": act,
+                            "violation": result,
+                            "batch_index": i,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                        self._pending_violations.append(pending_entry)
                         return {
                             "success": False,
-                            "error": f"Operation {i + 1} ({act}): {violation}",
+                            "error": f"Operation {i + 1} ({act}): {result.get('detail', 'Policy violation')}",
+                            "reason": result.get("reason"),
+                            "suggestions": result.get("suggestions", []),
+                            "pending_id": len(self._pending_violations) - 1,
                         }
         return super().apply_batch(target, operations)
+
+    def resolve_pending(self, pending_id: int, choice: str, **kwargs) -> Dict[str, Any]:
+        """Resolve a pending violation by user choice."""
+        if pending_id < 0 or pending_id >= len(self._pending_violations):
+            return {"success": False, "error": f"Invalid pending_id: {pending_id}"}
+
+        pending = self._pending_violations[pending_id]
+        content = pending["content"]
+        target = pending["target"]
+
+        if choice == "force":
+            # Force write bypassing policy
+            if pending["action"] == "add":
+                result = super().add(target, content)
+            elif pending["action"] == "replace":
+                result = super().replace(target, pending.get("old_text", ""), content)
+            else:
+                result = {"success": False, "error": f"Unknown action: {pending['action']}"}
+            if result.get("success"):
+                self._pending_violations.pop(pending_id)
+            return result
+
+        elif choice == "match_skill":
+            skill_name = kwargs.get("skill") or pending["violation"]["suggestions"][0].get("skill", "")
+            if not skill_name:
+                return {"success": False, "error": "No skill name provided"}
+            # Create a short index entry and append content to the skill
+            short_entry = f"§{_extract_topic(content)}：详见skill {skill_name}"
+            # Check if there's an old_text for replace
+            if pending["action"] == "replace" and pending.get("old_text"):
+                result = super().replace(target, pending["old_text"], short_entry)
+            else:
+                result = super().add(target, short_entry)
+            if result.get("success"):
+                # Append detailed content to the skill's references
+                _append_to_skill(skill_name, content)
+                self._pending_violations.pop(pending_id)
+            return result
+
+        elif choice == "create_skill":
+            skill_name = kwargs.get("skill") or _suggest_skill_name(content) or "misc-memory"
+            # Create skill and add short index
+            short_entry = f"§{_extract_topic(content)}：详见skill {skill_name}"
+            if pending["action"] == "replace" and pending.get("old_text"):
+                result = super().replace(target, pending["old_text"], short_entry)
+            else:
+                result = super().add(target, short_entry)
+            if result.get("success"):
+                _create_skill_from_content(skill_name, content)
+                self._pending_violations.pop(pending_id)
+            return result
+
+        elif choice == "shorten":
+            new_content = kwargs.get("content", "")
+            if not new_content:
+                return {"success": False, "error": "No shortened content provided. Use: mis(action='resolve', pending_id=N, choice='shorten', content='shortened version')"}
+            if pending["action"] == "replace" and pending.get("old_text"):
+                result = super().replace(target, pending["old_text"], new_content)
+            else:
+                result = super().add(target, new_content)
+            if result.get("success"):
+                self._pending_violations.pop(pending_id)
+            return result
+
+        else:
+            return {"success": False, "error": f"Unknown choice: {choice}. Use: force, match_skill, create_skill, shorten"}
 
 
 # ---------------------------------------------------------------------------
@@ -740,23 +1025,24 @@ MIS_MEMORY_SCHEMA = {
         "- check: validate content before writing to memory/user\n"
         "- search: keyword search across active + archive layers\n"
         "- status: show memory usage and archive stats\n"
-        "- archive: manually archive an active entry\n\n"
+        "- archive: manually archive an active entry\n"
+        "- resolve: resolve pending policy violations (blocked writes)\n\n"
         "WORKFLOW for writing:\n"
         "1. Call mis(action='check', content='...', target='memory')\n"
         "2. If pass → memory(action='add', content='...')\n"
-        "3. If fail → shorten to ≤150 chars or create a Skill"
+        "3. If fail → shorten to ≤150 chars, create a Skill, or resolve"
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["check", "search", "status", "archive"],
-                "description": "check: validate. search: cross-layer search. status: stats. archive: manual archive.",
+                "enum": ["check", "search", "status", "archive", "resolve"],
+                "description": "check: validate. search: cross-layer search. status: stats. archive: manual archive. resolve: resolve pending violations.",
             },
             "content": {
                 "type": "string",
-                "description": "Content to validate (for 'check' action).",
+                "description": "Content to validate (for 'check' action) or shortened content (for 'resolve' with choice='shorten').",
             },
             "target": {
                 "type": "string",
@@ -770,6 +1056,19 @@ MIS_MEMORY_SCHEMA = {
             "old_text": {
                 "type": "string",
                 "description": "Substring to match (for 'promote' and 'archive' actions).",
+            },
+            "pending_id": {
+                "type": "integer",
+                "description": "Pending violation ID (for 'resolve' action).",
+            },
+            "choice": {
+                "type": "string",
+                "enum": ["match_skill", "create_skill", "shorten", "force"],
+                "description": "Resolution choice (for 'resolve' action). Omit to list pending violations.",
+            },
+            "skill": {
+                "type": "string",
+                "description": "Skill name (for 'resolve' with match_skill or create_skill).",
             },
         },
         "required": ["action"],
@@ -846,6 +1145,37 @@ class MISProvider(MemoryProvider):
 
         # Scan existing violations
         self._scan_and_cache_violations()
+
+        # Monkey-patch tool_executor to use MISMemoryStore for memory writes
+        # This ensures ALL memory writes go through MIS policy checks
+        # without modifying Hermes core code
+        try:
+            import agent.tool_executor as _te
+            _original_handle = _te.handle_function_call if hasattr(_te, 'handle_function_call') else None
+            if _original_handle and not getattr(_original_handle, '_mis_patched', False):
+                _mis_store_ref = self._store  # capture MISMemoryStore reference
+
+                import functools
+                @functools.wraps(_original_handle)
+                def _mis_patched_handle_function_call(*args, **kwargs):
+                    # Intercept memory tool calls to use MISMemoryStore
+                    # handle_function_call(tool_call, agent, ..., task_id=...)
+                    if args and hasattr(args[0], 'function') and args[0].function.name == "memory":
+                        agent = args[1] if len(args) > 1 else None
+                        if agent is not None and hasattr(agent, '_memory_store'):
+                            original_store = agent._memory_store
+                            agent._memory_store = _mis_store_ref
+                            try:
+                                return _original_handle(*args, **kwargs)
+                            finally:
+                                agent._memory_store = original_store
+                    return _original_handle(*args, **kwargs)
+
+                _mis_patched_handle_function_call._mis_patched = True
+                _te.handle_function_call = _mis_patched_handle_function_call
+                logger.info("MIS: patched tool_executor.handle_function_call for memory interception")
+        except Exception as e:
+            logger.warning("MIS: failed to patch tool_executor: %s. Memory writes will bypass MIS checks.", e)
 
         logger.info(
             "MIS v2 initialized (memory=%d/%d chars, archive=%d entries, violations=%d)",
@@ -933,10 +1263,26 @@ class MISProvider(MemoryProvider):
             parts.append(f"💡 [MIS] Worth remembering: \"{pot['content'][:80]}\"")
             state.potential_memory = None
 
-        # 4. Violation scan
+        # 4. Pending violations (from blocked writes)
+        if self._store and hasattr(self._store, '_pending_violations'):
+            pending = self._store._pending_violations
+            if pending:
+                parts.append(f"\n⚠️ [MIS] {len(pending)} 条记忆写入被拦截，等待处理：")
+                for i, p in enumerate(pending[:3]):
+                    v = p.get("violation", {})
+                    content_preview = p["content"][:60]
+                    reason = v.get("detail", v.get("reason", "unknown"))
+                    parts.append(f"  [{i}] \"{content_preview}...\" ({reason})")
+                    for s in v.get("suggestions", [])[:2]:
+                        parts.append(f"      → {s['hint']}")
+                if len(pending) > 3:
+                    parts.append(f"  ...还有{len(pending)-3}条")
+                parts.append(f"  处理：mis(action='resolve', pending_id=0, choice='match_skill'|'create_skill'|'shorten'|'force')")
+
+        # 5. Violation scan (existing entries)
         violations = self._scan_and_cache_violations()
         if violations:
-            for v in violations[:3]:
+            for v in violations[:2]:
                 parts.append(f"[MIS Alert] {v['entry']}... → {v['reason']}")
 
         return "\n".join(parts)
@@ -986,9 +1332,9 @@ class MISProvider(MemoryProvider):
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:
         if target in ("memory", "user") and action in {"add", "replace"}:
-            violation = _check_mis_policy(content, self._store)
-            if violation:
-                logger.warning("MIS violation in on_memory_write (%s/%s): %s", target, action, violation[:200])
+            result = _check_mis_policy_v2(content, self._store)
+            if result.get("blocked"):
+                logger.warning("MIS violation in on_memory_write (%s/%s): %s", target, action, result.get("detail", "")[:200])
 
     # -- Session lifecycle hooks --------------------------------------------
 
@@ -1064,6 +1410,8 @@ class MISProvider(MemoryProvider):
                 return self._handle_status(state)
             elif action == "archive":
                 return self._handle_archive(args)
+            elif action == "resolve":
+                return self._handle_resolve(args)
             return json.dumps({"success": False, "error": f"Unknown mis action: {action}"})
 
         # Legacy: if somehow called with old tool name, handle memory actions
@@ -1345,6 +1693,46 @@ class MISProvider(MemoryProvider):
         archive_mgr.append_entry(entry)
         self._leave_archive_reference(entry, target)
         return json.dumps({"success": True, "archived": entry[:80]}, ensure_ascii=False)
+
+    def _handle_resolve(self, args: Dict) -> str:
+        """Resolve a pending violation."""
+        pending_id = args.get("pending_id")
+        choice = args.get("choice", "")
+
+        if pending_id is None:
+            return json.dumps({"success": False, "error": "pending_id required"}, ensure_ascii=False)
+        if not choice:
+            # List pending violations
+            if self._store and hasattr(self._store, '_pending_violations'):
+                pending = self._store._pending_violations
+                if not pending:
+                    return json.dumps({"success": True, "message": "No pending violations"}, ensure_ascii=False)
+                items = []
+                for i, p in enumerate(pending):
+                    v = p.get("violation", {})
+                    items.append({
+                        "id": i,
+                        "content": p["content"][:100],
+                        "target": p["target"],
+                        "action": p["action"],
+                        "reason": v.get("detail", v.get("reason", "")),
+                        "suggestions": v.get("suggestions", []),
+                    })
+                return json.dumps({"success": True, "pending": items}, ensure_ascii=False)
+            return json.dumps({"success": True, "message": "No pending violations"}, ensure_ascii=False)
+
+        if not self._store or not hasattr(self._store, '_pending_violations'):
+            return json.dumps({"success": False, "error": "MIS store not available"}, ensure_ascii=False)
+
+        # Resolve with choice
+        kwargs = {}
+        if args.get("skill"):
+            kwargs["skill"] = args["skill"]
+        if args.get("content"):
+            kwargs["content"] = args["content"]
+
+        result = self._store.resolve_pending(pending_id, choice, **kwargs)
+        return json.dumps(result, ensure_ascii=False)
 
     # -- Internal helpers ---------------------------------------------------
 
