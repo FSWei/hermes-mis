@@ -19,6 +19,13 @@ MIS 是 Hermes MemoryProvider 插件，把默认的扁平记忆系统升级为�
 - **代码级写入拦截**（非 prompt 级）
 - 支持 `memory` 和 `user` 双目标拦截
 
+### Layer 0: 注册表（registry.json）— 有生命周期的实体
+- 结构化 JSON 存储：项目 / 服务器 / 设备 / 账号（type 字段不设限）
+- 边界规则：**实体 → 注册表，知识 → Skill，偏好 → memory**
+- `mis(action='registry', op='list|add|update|remove|dashboard', entry='{"name":...,"type":...}')`
+- 每轮注入 ≤8 行紧凑摘要，完整查询走工具——不占 memory 配额
+- `op='dashboard'` 生成静态 HTML 面板到 `<hermes_home>/registry.html`
+
 ### Layer 2: 归档层（memory-archive / user-archive）
 - 溢出自动归档，带时间戳
 - 跨层搜索（4 层：active memory + user + archive + user-archive）
