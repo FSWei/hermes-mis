@@ -18,6 +18,13 @@ MIS is a Hermes MemoryProvider plugin that replaces the default flat memory syst
 - Short index lines only: `§project：see skill xxx`
 - Write validation at code level (format, length, structure, dead references)
 
+### Layer 0: Registry (`registry.json`) — entities with a lifecycle
+- Structured JSON store for projects / servers / devices / accounts (types are open-ended)
+- Boundary rule: **entities → registry, knowledge → skill, preferences → memory**
+- `mis(action='registry', op='list|add|update|remove|dashboard', entry='{"name":...,"type":...}')`
+- Compact summary injected each turn (≤8 lines); full query goes through the tool — costs no memory quota
+- `op='dashboard'` renders a static HTML panel to `<hermes_home>/registry.html`
+
 ### Layer 2: Archive (memory-archive skill)
 - Auto-created on first eviction
 - Entries with timestamps, searchable via `memory(action='search')`
