@@ -26,6 +26,7 @@ import re
 import shutil
 import threading
 from datetime import datetime
+from html import escape as _html_escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -59,7 +60,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _INDEX_LINE_RE = re.compile(
-    r'^\s*§\s*.+\S\s*[：:]?\s*(?:详见|see)\s+(?:skill|gbrain\s+page)\s+\S+',
+    r'^\s*§\s*.+\S\s*[：:]?\s*(?:详见|see)\s*(?:skill|gbrain\s+page)\s+\S+',
     re.IGNORECASE,
 )
 
@@ -250,6 +251,16 @@ def _build_suggestions(content: str, reason: str) -> list:
     """Build resolution suggestions for a policy violation."""
     suggestions = []
 
+    # Entity with a lifecycle (project/server/device/path/host) → registry first
+    if _PROJECT_DETAIL_PATTERNS and any(
+        p.search(content) for p, _ in _PROJECT_DETAIL_PATTERNS
+    ):
+        topic = _extract_topic(content)
+        suggestions.append({
+            "action": "registry",
+            "hint": f"实体信息→注册表: mis(action='registry', op='add', entry='{{\"name\":\"{topic[:24]}\",\"type\":\"project\",...}}')",
+        })
+
     # Try to match existing skill
     skill_match = _match_skill_for_entry(content)
     if skill_match:
@@ -381,28 +392,26 @@ def _find_dead_references(content: str) -> List[str]:
 
 
 def scan_memory_violations(entries: List[str]) -> List[Dict[str, str]]:
+    """Unified scan: flags ONLY entries the current write policy would block.
+
+    2026-09-24 fix: previously this used separate read-time patterns
+    (_PROJECT_DETAIL_PATTERNS + structure checks) that disagreed with the
+    write-time policy (_check_mis_policy_v2). Entries legitimately allowed
+    at write time (short/gray-zone) kept re-triggering alerts forever —
+    the "boy who cried wolf" problem. Now both paths share one standard.
+    """
     violations = []
-    max_len = _get_max_entry_length()
     for entry in entries:
         entry = entry.strip()
         if not entry:
             continue
-        if _INDEX_LINE_RE.match(entry):
-            continue
-        found = False
-        for pattern, label in _PROJECT_DETAIL_PATTERNS:
-            if pattern.search(entry):
-                violations.append({"entry": entry[:120], "reason": label})
-                found = True
-                break
-        if found:
-            continue
-        if len(entry) > 200:
-            violations.append({"entry": entry[:120], "reason": f"too long ({len(entry)} chars)"})
-            continue
-        struct_label = _check_reference_structure(entry)
-        if struct_label:
-            violations.append({"entry": entry[:120], "reason": struct_label})
+        result = _check_mis_policy_v2(entry)
+        if result.get("blocked"):
+            violations.append({
+                "entry": entry[:120],
+                "reason": result.get("detail") or result.get("reason", "violation"),
+                "fp": f"{abs(hash(entry))}:{result.get('reason', '')}",
+            })
     return violations
 
 
@@ -443,6 +452,252 @@ def _extract_keywords(entry: str) -> List[str]:
     return words[:10]  # limit to avoid noise
 
 
+def _similarity_ratio(a: str, b: str) -> float:
+    """Character-bigram Jaccard similarity (works for Chinese, no segmentation)."""
+    def bigrams(s: str) -> set:
+        s = re.sub(r'\s+', '', s.lower())
+        return set(s[i:i + 2] for i in range(len(s) - 1))
+    A, B = bigrams(a), bigrams(b)
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
+
+
+# ---------------------------------------------------------------------------
+# Persistent access log (2026-09-24) — survives session/gateway restarts.
+# The old session-local access_log died with each session, so "14 days
+# without access" was unmeasurable and stale detection never fired.
+# ---------------------------------------------------------------------------
+
+_ACCESS_LOG_FILE = "mis_access_log.json"
+
+
+def _access_log_path() -> Path:
+    try:
+        return get_hermes_home() / _ACCESS_LOG_FILE
+    except Exception:
+        return Path.home() / ".hermes" / _ACCESS_LOG_FILE
+
+
+def _load_access_log() -> Dict[str, Dict]:
+    try:
+        p = _access_log_path()
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        logger.debug("MIS: access log load failed: %s", e)
+    return {}
+
+
+def _save_access_log(log: Dict[str, Dict]) -> None:
+    try:
+        _access_log_path().write_text(
+            json.dumps(log, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.debug("MIS: access log save failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Registry (Layer 0) — 2026-09-24.
+# Structured entities with a lifecycle: projects, servers, devices, accounts,
+# anything. Knowledge stays in Skills, preferences stay in Memory/User —
+# the registry only holds *entities you operate on*.
+#
+# Storage: <hermes_home>/registry.json (schema-flexible, per-entry fields).
+# Why JSON not xlsx/md: machine-validatable, git-diffable, no extra deps;
+# a human dashboard is generated from it on demand (op='dashboard').
+# ---------------------------------------------------------------------------
+
+_REGISTRY_FILE = "registry.json"
+
+
+class _Registry:
+    """Structured entity registry. Thread-safe, lazy-loaded, disk-backed."""
+
+    def __init__(self):
+        self._path: Optional[Path] = None
+        self._entries: Optional[List[Dict[str, Any]]] = None
+        self._lock = threading.Lock()
+
+    @property
+    def path(self) -> Path:
+        if self._path is None:
+            try:
+                self._path = get_hermes_home() / _REGISTRY_FILE
+            except Exception:
+                self._path = Path.home() / ".hermes" / _REGISTRY_FILE
+        return self._path
+
+    def _load(self) -> List[Dict[str, Any]]:
+        if self._entries is None:
+            try:
+                if self.path.exists():
+                    data = json.loads(self.path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        self._entries = data.get("entries", [])
+                    elif isinstance(data, list):
+                        self._entries = data
+                    else:
+                        self._entries = []
+                else:
+                    self._entries = []
+            except Exception as e:
+                logger.warning("MIS registry load failed, starting empty: %s", e)
+                self._entries = []
+        return self._entries
+
+    def _save(self) -> None:
+        try:
+            payload = {"version": 1, "updated": datetime.now().isoformat(),
+                       "entries": self._entries or []}
+            self.path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.error("MIS registry save failed: %s", e)
+
+    def list(self, keyword: str = "") -> List[Dict[str, Any]]:
+        entries = self._load()
+        if keyword:
+            k = keyword.lower()
+            entries = [e for e in entries if any(
+                k in str(v).lower() for v in e.values()
+            )]
+        return entries
+
+    def add(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            return {"success": False, "error": "entry requires at least {'name': ...}"}
+        with self._lock:
+            entries = self._load()
+            name = str(entry["name"]).strip()
+            for e in entries:
+                if str(e.get("name", "")).lower() == name.lower():
+                    return {"success": False,
+                            "error": f"Registry entry '{name}' already exists — use op='update'"}
+            entry["name"] = name
+            entry.setdefault("type", "entity")       # open-ended: project/server/device/...
+            entry.setdefault("status", "active")
+            entry["created"] = datetime.now().isoformat()
+            entry["updated"] = entry["created"]
+            entries.append(entry)
+            self._save()
+        return {"success": True, "entry": entry, "count": len(entries)}
+
+    def update(self, ident: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(ident, dict):
+            return {"success": False, "error": "entry with name/id required"}
+        key = ident.get("name") or ident.get("id")
+        if not key:
+            return {"success": False, "error": "entry with name/id required"}
+        with self._lock:
+            entries = self._load()
+            for e in entries:
+                if str(e.get("name", "")).lower() == str(key).lower() or e.get("id") == key:
+                    e.update({k: v for k, v in ident.items() if k not in ("id", "created")})
+                    e["updated"] = datetime.now().isoformat()
+                    self._save()
+                    return {"success": True, "entry": e}
+        return {"success": False, "error": f"No registry entry matching '{key}'"}
+
+    def remove(self, ident: Dict[str, Any]) -> Dict[str, Any]:
+        key = (ident or {}).get("name") or (ident or {}).get("id")
+        if not key:
+            return {"success": False, "error": "name or id required"}
+        with self._lock:
+            entries = self._load()
+            for i, e in enumerate(entries):
+                if str(e.get("name", "")).lower() == str(key).lower() or e.get("id") == key:
+                    removed = entries.pop(i)
+                    self._save()
+                    return {"success": True, "removed": removed}
+        return {"success": False, "error": f"No registry entry matching '{key}'"}
+
+    def dashboard(self) -> str:
+        """Generate a static HTML dashboard. Returns file path."""
+        entries = self._load()
+        rows = []
+        type_names = set()
+        for e in entries:
+            type_names.add(str(e.get("type", "entity")))
+            status = str(e.get("status", "active"))
+            badge_cls = {"active": "ok", "paused": "warn", "archived": "off"}.get(status, "ok")
+            cells = []
+            for k in ("name", "type", "status", "path", "server", "skill", "updated"):
+                v = e.get(k, "")
+                if k == "name":
+                    cells.append(f"<td class='name'>{_html_escape(str(v))}</td>")
+                elif v:
+                    cells.append(f"<td>{_html_escape(str(v))}</td>")
+            # any extra fields beyond the standard columns
+            extra = {k: v for k, v in e.items()
+                     if k not in ("name", "type", "status", "path", "server", "skill",
+                                  "updated", "created", "id")}
+            for k, v in extra.items():
+                cells.append(f"<td class='dim'>{_html_escape(str(k))}: {_html_escape(str(v))}</td>")
+            rows.append(
+                f"<tr><td class='status'><span class='badge {badge_cls}'>{_html_escape(status)}</span></td>"
+                + "".join(cells) + "</tr>"
+            )
+        n = len(entries)
+        if rows:
+            table_html = (
+                "<table><thead><tr><th>Status</th><th>Name</th><th>Type</th>"
+                "<th>Path / Server / Skill / Updated</th></tr></thead><tbody>"
+                + "".join(rows) + "</tbody></table>"
+            )
+        else:
+            table_html = (
+                "<div class='empty'>Registry is empty — "
+                "mis(action='registry', op='add', entry='{\"name\":..., \"type\":...}')</div>"
+            )
+        html_doc = f"""<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIS Registry — {n} entities</title>
+<style>
+  :root {{ --bg:#16181d; --panel:#1e2128; --line:#2c3038; --fg:#c9cdd4;
+           --dim:#7d838f; --gold:#c9a227; --ok:#4a9e6a; --warn:#c9862b; --off:#5c6270; }}
+  * {{ box-sizing:border-box; margin:0; }}
+  body {{ background:var(--bg); color:var(--fg); font:15px/1.6 "Segoe UI","PingFang SC",sans-serif;
+          padding:32px; }}
+  h1 {{ font-size:22px; font-weight:600; margin-bottom:4px; }}
+  h1 span {{ color:var(--gold); }}
+  .meta {{ color:var(--dim); font-size:13px; margin-bottom:20px; }}
+  .tablewrap {{ background:var(--panel); border:1px solid var(--line); border-radius:10px;
+                overflow-x:auto; }}
+  table {{ border-collapse:collapse; width:100%; min-width:720px; }}
+  th {{ text-align:left; font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+        color:var(--dim); padding:12px 16px; border-bottom:1px solid var(--line); }}
+  td {{ padding:11px 16px; border-bottom:1px solid var(--line); font-size:14px;
+        vertical-align:top; }}
+  tr:last-child td {{ border-bottom:none; }}
+  td.name {{ font-weight:600; color:#e8eaed; white-space:nowrap; }}
+  td.dim {{ color:var(--dim); font-size:13px; }}
+  .badge {{ display:inline-block; padding:2px 10px; border-radius:99px; font-size:12px;
+            font-weight:600; }}
+  .badge.ok   {{ background:rgba(74,158,106,.16);  color:var(--ok); }}
+  .badge.warn {{ background:rgba(201,134,43,.16);  color:var(--warn); }}
+  .badge.off  {{ background:rgba(92,98,112,.2);    color:var(--off); }}
+  .empty {{ padding:40px; text-align:center; color:var(--dim); }}
+  footer {{ margin-top:14px; color:var(--dim); font-size:12px; }}
+</style></head>
+<body>
+  <h1>MIS <span>Registry</span></h1>
+  <div class="meta">{n} entities · {', '.join(sorted(type_names)) or '—'} · generated {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
+  <div class="tablewrap">
+  {table_html}
+  </div>
+  <footer>Source: {self.path} · regenerate: mis(action='registry', op='dashboard')</footer>
+</body></html>"""
+        out = self.path.with_suffix(".html")
+        out.write_text(html_doc, encoding="utf-8")
+        return str(out)
+
+
 # ---------------------------------------------------------------------------
 # Per-Session State Management (NEW — concurrency safe)
 # ---------------------------------------------------------------------------
@@ -452,6 +707,7 @@ class _SessionState:
     __slots__ = (
         "pending_write_failure", "access_log", "potential_memory",
         "current_turn", "eviction_warning_sent", "session_id",
+        "alerted_fps", "similar_scan_done",
     )
 
     def __init__(self, session_id: str = ""):
@@ -461,6 +717,8 @@ class _SessionState:
         self.potential_memory: Optional[Dict] = None
         self.current_turn: int = 0
         self.eviction_warning_sent: bool = False
+        self.alerted_fps: set = set()          # alert fingerprints already shown this session
+        self.similar_scan_done: bool = False   # similar-entry scan runs once per session
 
 
 # ---------------------------------------------------------------------------
@@ -877,6 +1135,25 @@ class MISMemoryStore(MemoryStore):
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         if target in ("memory", "user"):
+            # Cross-store duplicate check first (2026-09-24): same topic or
+            # >60% similar content in EITHER store → block with merge hints.
+            dup = self._find_duplicate(target, content)
+            if dup:
+                pending_entry = {
+                    "content": content,
+                    "target": target,
+                    "action": "add",
+                    "violation": dup,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                self._pending_violations.append(pending_entry)
+                return {
+                    "success": False,
+                    "error": dup.get("detail", "Duplicate entry"),
+                    "reason": dup.get("reason"),
+                    "suggestions": dup.get("suggestions", []),
+                    "pending_id": len(self._pending_violations) - 1,
+                }
             result = _check_mis_policy_v2(content, self)
             if result.get("blocked"):
                 pending_entry = {
@@ -896,8 +1173,69 @@ class MISMemoryStore(MemoryStore):
                 }
         return super().add(target, content)
 
+    def _find_duplicate(self, target: str, content: str, exclude_old: str = "") -> Optional[Dict[str, Any]]:
+        """Detect duplicate/similar entries across BOTH stores (memory + user).
+
+        Returns a violation dict (reason=duplicate_topic / similar_entry) or None.
+        """
+        content = content.strip()
+        if not content:
+            return None
+        topic = _extract_topic(content).strip()
+        if len(topic) < 2:
+            topic = content[:20]
+        for t in ("memory", "user"):
+            for e in self._entries_for(t):
+                e = e.strip()
+                if not e or e == content:
+                    continue  # identical text — native add() handles it
+                if exclude_old and exclude_old in e:
+                    continue  # the entry being replaced — not a duplicate
+                e_topic = _extract_topic(e).strip()
+                if topic and e_topic == topic:
+                    return {
+                        "blocked": True,
+                        "reason": "duplicate_topic",
+                        "detail": f"Topic '{topic}' already exists in {t}: {e[:80]}",
+                        "suggestions": [
+                            {"action": "force", "hint": "确实是不同内容→force 写入"},
+                            {"action": "merge", "hint": f"合并到已有条目: memory(action='replace', old_text='{e[:40]}', content='合并后内容')"},
+                        ],
+                    }
+                if len(content) > 60 and len(e) > 60 and _similarity_ratio(content, e) > 0.6:
+                    return {
+                        "blocked": True,
+                        "reason": "similar_entry",
+                        "detail": f"{int(_similarity_ratio(content, e) * 100)}% similar to a {t} entry: {e[:80]}",
+                        "suggestions": [
+                            {"action": "force", "hint": "信息不同→force 写入"},
+                            {"action": "merge", "hint": f"合并/替换已有条目: memory(action='replace', old_text='{e[:40]}', content='合并后内容')"},
+                        ],
+                    }
+        return None
+
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         if target in ("memory", "user"):
+            # Duplicate check excludes the entry being replaced (its own topic match is expected)
+            dup = self._find_duplicate(target, new_content, exclude_old=old_text)
+            if dup:
+                pending_entry = {
+                    "content": new_content,
+                    "target": target,
+                    "action": "replace",
+                    "old_text": old_text,
+                    "violation": dup,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                self._pending_violations.append(pending_entry)
+                return {
+                    "success": False,
+                    "error": dup.get("detail", "Duplicate entry"),
+                    "reason": dup.get("reason"),
+                    "suggestions": dup.get("suggestions", []),
+                    "pending_id": len(self._pending_violations) - 1,
+                    "old_text": old_text,
+                }
             result = _check_mis_policy_v2(new_content, self)
             if result.get("blocked"):
                 pending_entry = {
@@ -1026,7 +1364,11 @@ MIS_MEMORY_SCHEMA = {
         "- search: keyword search across active + archive layers\n"
         "- status: show memory usage and archive stats\n"
         "- archive: manually archive an active entry\n"
-        "- resolve: resolve pending policy violations (blocked writes)\n\n"
+        "- resolve: resolve pending policy violations (blocked writes)\n"
+        "- registry: structured entities (projects/servers/devices/accounts).\n"
+        "  ops: list (default), add, update, remove, dashboard.\n"
+        "  Entry JSON: {\"name\":..., \"type\":..., \"status\":..., plus any fields}.\n"
+        "  Use registry for anything WITH A LIFECYCLE; knowledge → skill, preferences → memory.\n\n"
         "WORKFLOW for writing:\n"
         "1. Call mis(action='check', content='...', target='memory')\n"
         "2. If pass → memory(action='add', content='...')\n"
@@ -1037,8 +1379,17 @@ MIS_MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["check", "search", "status", "archive", "resolve"],
-                "description": "check: validate. search: cross-layer search. status: stats. archive: manual archive. resolve: resolve pending violations.",
+                "enum": ["check", "search", "status", "archive", "resolve", "registry"],
+                "description": "check: validate. search: cross-layer search. status: stats. archive: manual archive. resolve: resolve pending violations. registry: manage structured entities.",
+            },
+            "op": {
+                "type": "string",
+                "enum": ["list", "add", "update", "remove", "dashboard"],
+                "description": "Registry sub-operation (default 'list'). dashboard generates an HTML panel and returns its path.",
+            },
+            "entry": {
+                "type": "string",
+                "description": "Registry entry as JSON string, e.g. '{\"name\":\"chips-town\",\"type\":\"project\",\"path\":\"/...\",\"status\":\"active\"}'. For update/remove: include name (or id) to identify + fields to change.",
             },
             "content": {
                 "type": "string",
@@ -1051,7 +1402,7 @@ MIS_MEMORY_SCHEMA = {
             },
             "keyword": {
                 "type": "string",
-                "description": "Search keyword (for 'search' action).",
+                "description": "Search keyword (for 'search' action) or registry list filter.",
             },
             "old_text": {
                 "type": "string",
@@ -1102,6 +1453,9 @@ class MISProvider(MemoryProvider):
         self._user_archive = _UserArchiveManager()
         self._deep_archive = _DeepArchiveManager()
         self._violations_cache: List[Dict[str, str]] = []
+        self._access_persist: Dict[str, Dict] = _load_access_log()
+        self._access_dirty: int = 0
+        self._registry = _Registry()
 
     # -- State management ---------------------------------------------------
 
@@ -1142,6 +1496,19 @@ class MISProvider(MemoryProvider):
         )
         self._store.load_from_disk()
         self._session_id = session_id
+
+        # Seed persistent access log for entries never seen (stale-detection baseline)
+        now_iso = datetime.now().isoformat()
+        seeded = False
+        try:
+            for e in self._store._entries_for("memory"):
+                if e not in self._access_persist:
+                    self._access_persist[e] = {"last_seen": now_iso, "count": 0}
+                    seeded = True
+            if seeded:
+                _save_access_log(self._access_persist)
+        except Exception as e:
+            logger.debug("MIS: access log seeding failed: %s", e)
 
         # Scan existing violations
         self._scan_and_cache_violations()
@@ -1201,8 +1568,26 @@ class MISProvider(MemoryProvider):
             f"- Format: §name：see skill xxx\n"
             f"- Overflow → auto-archived (not lost)\n"
             f"- ⚠️ BEFORE writing: call mis(action='check', content=..., target=...) to validate\n"
-            f"- Tools: mis (check/search/status/archive), memory (write)"
+            f"- Entities with lifecycle (project/server/device) → mis(action='registry')\n"
+            f"- Tools: mis (check/search/status/archive/registry), memory (write)"
         )
+
+        # Registry summary (Layer 0 — compact, capped at 8 lines)
+        try:
+            reg_entries = self._registry.list()
+            if reg_entries:
+                lines = [
+                    f"  {e.get('name')} [{e.get('type', 'entity')}/{e.get('status', 'active')}]"
+                    for e in reg_entries[:8]
+                ]
+                more = f"  ...+{len(reg_entries) - 8} more" if len(reg_entries) > 8 else ""
+                parts.append(
+                    f"\n🗄 Registry ({len(reg_entries)}):\n" + "\n".join(lines)
+                    + ("\n" + more if more else "")
+                    + "\n  ops: mis(action='registry', op='list|add|update|remove|dashboard')"
+                )
+        except Exception:
+            pass
 
         # 2. Pending write failure warning
         pending = state.pending_write_failure
@@ -1279,11 +1664,41 @@ class MISProvider(MemoryProvider):
                     parts.append(f"  ...还有{len(pending)-3}条")
                 parts.append(f"  处理：mis(action='resolve', pending_id=0, choice='match_skill'|'create_skill'|'shorten'|'force')")
 
-        # 5. Violation scan (existing entries)
+        # 5. Violation scan (existing entries) — dedup per session so the
+        #    same alert is shown at most once instead of every API call.
         violations = self._scan_and_cache_violations()
-        if violations:
-            for v in violations[:2]:
-                parts.append(f"[MIS Alert] {v['entry']}... → {v['reason']}")
+        shown = 0
+        for v in violations:
+            fp = v.get("fp") or f"{v['entry']}:{v['reason']}"
+            if fp in state.alerted_fps:
+                continue
+            state.alerted_fps.add(fp)
+            parts.append(f"[MIS Alert] {v['entry']}... → {v['reason']}")
+            shown += 1
+            if shown >= 2:
+                break
+
+        # 6. Similar-entry merge suggestion (once per session, cheap bigram scan)
+        if not state.similar_scan_done and self._store:
+            state.similar_scan_done = True
+            try:
+                entries = [e for e in self._store._entries_for("memory") if len(e) > 40][:40]
+                tips = []
+                for i in range(len(entries)):
+                    for j in range(i + 1, len(entries)):
+                        r = _similarity_ratio(entries[i], entries[j])
+                        if r > 0.6:
+                            tips.append(
+                                f"§{_extract_topic(entries[i])} ↔ §{_extract_topic(entries[j])} ({r:.0%})"
+                            )
+                            if len(tips) >= 2:
+                                break
+                    if len(tips) >= 2:
+                        break
+                if tips:
+                    parts.append("💡 [MIS] 疑似重复条目可合并: " + "; ".join(tips))
+            except Exception as e:
+                logger.debug("MIS similar scan failed: %s", e)
 
         return "\n".join(parts)
 
@@ -1376,11 +1791,33 @@ class MISProvider(MemoryProvider):
                 logger.info("MIS: force-archived pending %s write at session end", pending_target)
             state.pending_write_failure = None
 
-        # 2. Maintenance scan (log only, no auto-action)
-        stale = self._find_stale_entries(days=14)
-        dead = self._find_dead_references_all()
-        if stale or dead:
-            logger.info("MIS: session end — %d stale, %d dead refs", len(stale), len(dead))
+        # 2. Auto-archive stale entries + save access log
+        # (2026-09-24: was "log only, no auto-action" — nothing ever happened.)
+        try:
+            stale = self._find_stale_entries(days=14)
+            archived = 0
+            for entry in stale:
+                if archived >= 5:  # safety cap: max 5 auto-archives per session end
+                    break
+                if entry in self._store._entries_for("memory"):
+                    self._store.remove("memory", entry)
+                    self._archive.append_entry(entry)
+                    self._access_persist.pop(entry, None)
+                    archived += 1
+                    logger.info("MIS: auto-archived stale entry (%d chars)", len(entry))
+            if archived:
+                _save_access_log(self._access_persist)
+                self._access_dirty = 0
+            dead = self._find_dead_references_all()
+            if stale or dead:
+                logger.info("MIS: session end — %d stale (%d archived), %d dead refs",
+                            len(stale), archived, len(dead))
+        except Exception as e:
+            logger.warning("MIS: session-end maintenance failed: %s", e)
+        # Always flush the access log before state is torn down
+        if self._access_dirty:
+            _save_access_log(self._access_persist)
+            self._access_dirty = 0
 
         # 3. Cleanup session state
         self._cleanup_session(self._session_id)
@@ -1412,6 +1849,8 @@ class MISProvider(MemoryProvider):
                 return self._handle_archive(args)
             elif action == "resolve":
                 return self._handle_resolve(args)
+            elif action == "registry":
+                return self._handle_registry(args)
             return json.dumps({"success": False, "error": f"Unknown mis action: {action}"})
 
         # Legacy: if somehow called with old tool name, handle memory actions
@@ -1446,6 +1885,47 @@ class MISProvider(MemoryProvider):
         return json.dumps({"success": False, "error": f"Unknown action: {action}"})
 
     # -- Tool handlers ------------------------------------------------------
+
+    def _handle_registry(self, args: Dict) -> str:
+        """Registry CRUD + dashboard. Layer 0: structured entities."""
+        op = (args.get("op") or "list").lower()
+        reg = self._registry
+        try:
+            if op == "list":
+                entries = reg.list(args.get("keyword", ""))
+                return json.dumps({"success": True, "count": len(entries),
+                                   "entries": entries}, ensure_ascii=False)
+            if op in ("add", "update"):
+                raw = args.get("entry", "")
+                entry = json.loads(raw) if isinstance(raw, str) else raw
+                if not isinstance(entry, dict):
+                    return json.dumps({"success": False,
+                                       "error": "entry must be a JSON object string"},
+                                      ensure_ascii=False)
+                result = reg.add(entry) if op == "add" else reg.update(entry)
+                return json.dumps(result, ensure_ascii=False)
+            if op == "remove":
+                raw = args.get("entry", "") or args.get("keyword", "")
+                ident = json.loads(raw) if isinstance(raw, str) and raw.strip().startswith("{") \
+                    else {"name": raw}
+                if isinstance(ident, str):
+                    ident = {"name": ident}
+                result = reg.remove(ident)
+                return json.dumps(result, ensure_ascii=False)
+            if op == "dashboard":
+                path = reg.dashboard()
+                return json.dumps({"success": True, "path": path,
+                                   "count": len(reg.list())}, ensure_ascii=False)
+            return json.dumps({"success": False,
+                               "error": f"Unknown registry op: {op}. "
+                                        "Use list|add|update|remove|dashboard"},
+                              ensure_ascii=False)
+        except json.JSONDecodeError as e:
+            return json.dumps({"success": False, "error": f"Invalid entry JSON: {e}"},
+                              ensure_ascii=False)
+        except Exception as e:
+            logger.warning("MIS registry op failed: %s", e)
+            return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
 
     def _handle_mis_check(self, args: Dict) -> str:
         """Validate content against MIS policy. No write, pure check."""
@@ -1737,15 +2217,23 @@ class MISProvider(MemoryProvider):
     # -- Internal helpers ---------------------------------------------------
 
     def _track_access(self, query: str, state: _SessionState):
-        """Keyword-based access tracking."""
+        """Keyword-based access tracking (session + persistent log)."""
         query_lower = query.lower()
         for entry in self._store._entries_for("memory"):
             keywords = _extract_keywords(entry)
             if any(kw.lower() in query_lower for kw in keywords if len(kw) > 2):
-                state.access_log[entry] = {
+                base = state.access_log.get(entry, {}).get("count", 0)
+                prev = self._access_persist.get(entry, {})
+                rec = {
                     "last_seen": datetime.now().isoformat(),
-                    "count": state.access_log.get(entry, {}).get("count", 0) + 1,
+                    "count": max(int(prev.get("count", 0)), base) + 1,
                 }
+                state.access_log[entry] = rec
+                self._access_persist[entry] = rec
+                self._access_dirty += 1
+        if self._access_dirty >= 25:
+            _save_access_log(self._access_persist)
+            self._access_dirty = 0
 
     def _check_capacity(self, state: _SessionState):
         """Auto-evict when memory or user exceeds 95%."""
@@ -1755,23 +2243,32 @@ class MISProvider(MemoryProvider):
                 self._auto_evict(state, target=target, target_ratio=0.85)
 
     def _auto_evict(self, state: _SessionState, target: str = "memory", target_ratio: float = 0.85):
-        """Evict low-priority entries to archive."""
+        """Evict low-priority entries to archive.
+
+        Sort order (2026-09-24 fix): evictable priorities FIRST —
+        P3 → P2 → P1 → P0 last; within same priority, least-accessed first.
+        The old code sorted P0 first and `break`-ed on the first P0, which
+        meant any store containing a single P0 entry never evicted anything
+        (user store was stuck at 98.5% because of this).
+        """
         entries = self._store._entries_for(target)
         ranked = sorted(entries, key=lambda e: (
-            _priority_rank(e),
-            self._get_last_accessed_rank(e, state),
+            -_priority_rank(e),                      # P3 (-3) first, P0 (0) last
+            self._get_access_count(e, state),        # least-accessed evicted first
         ))
-
         target_chars = int(self._store._char_limit(target) * target_ratio)
         archive_mgr = self._user_archive if target == "user" else self._archive
+        evicted = 0
         for entry in ranked:
             if _classify_priority(entry) == "P0":
-                break
+                break  # P0 sorts last — nothing evictable remains
             if self._store._char_count(target) <= target_chars:
                 break
             self._store.remove(target, entry)
             archive_mgr.append_entry(entry)
+            evicted += 1
             logger.info("MIS: auto-evicted %s entry (%d chars)", target, len(entry))
+        return evicted
 
     def _force_evict_for_space(self, needed_chars: int) -> bool:
         """Precisely evict entries to make room (for promote)."""
@@ -1790,11 +2287,11 @@ class MISProvider(MemoryProvider):
 
         return freed >= needed_chars
 
-    def _get_last_accessed_rank(self, entry: str, state: _SessionState) -> int:
-        """Return negative timestamp for sorting (most recent first)."""
+    def _get_access_count(self, entry: str, state: _SessionState) -> int:
+        """Access count for sorting (ascending → least-accessed evicted first)."""
         log = state.access_log.get(entry)
         if log:
-            return -int(log.get("count", 0))
+            return int(log.get("count", 0))
         return 0
 
     def _leave_archive_reference(self, entry: str, target: str = "memory"):
@@ -1808,21 +2305,24 @@ class MISProvider(MemoryProvider):
             self._store.add(target, ref_line)
 
     def _find_stale_entries(self, days: int = 14) -> List[str]:
-        """Find entries not accessed in N days (session-local tracking)."""
-        state = self._get_state()
+        """Find entries not accessed in N days (persistent log — survives restarts).
+
+        Returns FULL entries (needed for removal). 2026-09-24: switched from
+        session-local access_log (died every session, so stale detection NEVER
+        fired) to the disk-persisted log.
+        """
         stale = []
         now = datetime.now()
         for entry in self._store._entries_for("memory"):
             if _classify_priority(entry) == "P0":
                 continue
-            log = state.access_log.get(entry)
+            log = self._access_persist.get(entry) or self._get_state().access_log.get(entry)
             if not log:
-                # Not accessed this session — check if entry is old
-                continue
+                continue  # never seen — seeded at init, so this is rare
             try:
                 last = datetime.fromisoformat(log["last_seen"])
                 if (now - last).days >= days:
-                    stale.append(entry[:60])
+                    stale.append(entry)
             except (ValueError, KeyError):
                 pass
         return stale
@@ -1838,6 +2338,11 @@ class MISProvider(MemoryProvider):
 
     def _scan_and_cache_violations(self) -> List[Dict[str, str]]:
         try:
+            # Re-sync in-memory copy with disk first (2026-09-24 fix):
+            # writes may have landed on disk via a different store instance,
+            # leaving this store's cache stale and alerting on deleted entries.
+            if self._store and hasattr(self._store, "load_from_disk"):
+                self._store.load_from_disk()
             entries = self._store._entries_for("memory")
             self._violations_cache = scan_memory_violations(entries)
         except Exception as e:
