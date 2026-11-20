@@ -9,6 +9,30 @@
 
 ---
 
+## ✨ v2.1 (2026-11-20): a real write gate, one rule set across hosts
+
+The "Real-Time Write Interception" described below **did not actually fire on Hermes 0.23**: `memory`
+is an agent-loop inline tool (`model_tools._AGENT_LOOP_TOOLS`), so it bypasses `pre_tool_call` hooks,
+its provider schema is filtered out by `_HERMES_CORE_TOOLS`, and `on_memory_write` is a post-write callback.
+
+v2.1 wraps the **store** instead — the only point that is truly on the write path:
+
+```
+memory tool → MemoryStore.add / MemoryStore.apply_batch
+                    ↓ node brain.js check
+             ok=false → {success:false, error:"[brain] …", suggestions}
+```
+
+- Idempotent class-level install (`_install_store_gate()`), re-armed in `initialize()` and store `__init__`;
+- Covers both single `add` and batch `operations` (`apply_batch`);
+- The policy is **not re-implemented in Python**: it calls `brain.js` (the chips-brain kernel), the same
+  `policy.js` used by DeepSeek Harness;
+- `MIS_BRAIN_DISABLE=1` falls back to local policy (tests/offline); a missing brain.js falls back too;
+- Verified: dead skill references and structured bullet batches are rejected; valid index entries still write.
+
+> Known boundary: Hermes-side writes are checked but not appended to `audit.jsonl` (audit is complete on
+> the DSH and CLI paths).
+
 ## 🎯 What is MIS?
 
 MIS is a Hermes MemoryProvider plugin that replaces the default flat memory system with a managed two-layer architecture:

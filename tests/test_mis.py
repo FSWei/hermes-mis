@@ -9,6 +9,9 @@ execs every *.py inside the plugin dir (plugins/memory/__init__.py
 `provider_dir.glob("*.py")`), so module-level test code would run inside
 the gateway process and hijack HERMES_HOME / call sys.exit().
 """
+import os
+os.environ.setdefault("MIS_BRAIN_DISABLE", "1")
+
 import json
 import os
 import sys

@@ -21,10 +21,14 @@ Installation:
 from __future__ import annotations
 
 import json
+import os
 import logging
 import re
 import shutil
+import subprocess
 import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from html import escape as _html_escape
 from pathlib import Path
@@ -194,11 +198,72 @@ def _check_mis_policy(content: str, store=None) -> Optional[str]:
     return None
 
 
+_BRAIN_BIN = Path("/mnt/d/agent-brain/.brain/bin/brain.js")
+_BRAIN_CHECK_DISABLED = False  # 熔断开关：brain.js 不在/报错时自动回退本地策略
+
+
+def _brain_check(content: str, target: str = "memory") -> Optional[dict]:
+    """把写判定委托给 brain.js —— 与 DSH 侧执行同一份规则（policy.js）。
+
+    返回 {"ok": bool, ...} 或 None（不可用/出错，由本地 _check_mis_policy_v2 兜底）。
+    只读，不拿锁，不会与写入死锁。
+    """
+    global _BRAIN_CHECK_DISABLED
+    if _BRAIN_CHECK_DISABLED or not _BRAIN_BIN.exists():
+        return None
+    # 测试/离线场景：MIS_BRAIN_DISABLE=1 时只用本地策略，不依赖 brain.js 与真实脑目录
+    if os.environ.get("MIS_BRAIN_DISABLE", "").lower() in ("1", "true", "yes"):
+        return None
+    try:
+        with open("/tmp/mis_bridge.log", "a", encoding="utf-8") as _f:
+            _f.write(f"hit target={target} len={len(content)} file={__file__}\n")
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(
+            ["node", str(_BRAIN_BIN), "check", "--file", "USER" if target == "user" else "MEMORY", "--text", content],
+            capture_output=True, text=True, timeout=8,
+        )
+        out = (proc.stdout or "").strip()
+        if not out:
+            return None
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = json.loads(out.splitlines()[-1])
+        if not isinstance(data, dict) or "ok" not in data:
+            return None
+        return data
+    except Exception:
+        return None
+
+
 def _check_mis_policy_v2(content: str, store=None) -> dict:
-    """Structured policy check with resolution suggestions."""
+    """Structured policy check with resolution suggestions.
+
+    优先委托 brain.js（跨宿主同一份规则）；brain.js 不可用时用下面的本地实现。
+    """
     content = content.strip()
     if not content:
         return {"blocked": False}
+
+    target = "memory"
+    try:
+        if store is not None:
+            target = getattr(store, "target", target) or target
+    except Exception:
+        target = "memory"
+    decided = _brain_check(content, target)
+    if isinstance(decided, dict):
+        if decided.get("ok") is False:
+            return {
+                "blocked": True,
+                "reason": decided.get("reason") or "policy",
+                "detail": "[brain] " + str(decided.get("detail") or ""),
+                "suggestions": decided.get("suggestions") or [],
+            }
+        if decided.get("ok") is True:
+            return {"blocked": False}
 
     # Index line format → always allowed
     if _INDEX_LINE_RE.match(content):
@@ -378,14 +443,24 @@ def _create_skill_from_content(skill_name: str, content: str) -> bool:
 
 
 def _find_dead_references(content: str) -> List[str]:
-    """Check if referenced skills exist."""
+    """Check if referenced skills exist.
+
+    Skills live in category subdirectories (e.g. ``software-development/todo-ledger``),
+    so a flat ``skills_dir / name`` check reports every categorized skill as dead.
+    Match directly first, then anywhere under the skills root.
+    """
     try:
         skills_dir = get_hermes_home() / "skills"
         dead = []
         for match in re.finditer(r'(?:详见|see)\s+skill\s+[`]?([\w-]+)', content, re.I):
             skill_name = match.group(1)
-            if not (skills_dir / skill_name).exists():
-                dead.append(skill_name)
+            direct = skills_dir / skill_name
+            if direct.exists():
+                continue
+            if any(c.is_dir() and (c / "SKILL.md").exists()
+                   for c in skills_dir.rglob(skill_name)):
+                continue
+            dead.append(skill_name)
         return dead
     except Exception:
         return []
@@ -512,6 +587,43 @@ def _save_access_log(log: Dict[str, Dict]) -> None:
 # ---------------------------------------------------------------------------
 
 _REGISTRY_FILE = "registry.json"
+
+
+# ---------------------------------------------------------------------------
+# 跨宿主写锁（2026-11-18）
+# 与 DSH 侧 .brain/bin/brain.js 共用同一把锁：D:\agent-brain\.brain\lock
+# （WSL 侧路径 /mnt/d/agent-brain/.brain/lock）。mkdir 在 NTFS 上是原子的。
+# 超时不硬等：宁可裸写一次，也不能把记忆写入卡死。
+_BRAIN_LOCK_DIR = Path("/mnt/d/agent-brain/.brain/lock")
+
+
+@contextmanager
+def _brain_write_lock(timeout: float = 5.0, stale: float = 60.0):
+    deadline = time.time() + timeout
+    acquired = False
+    while True:
+        try:
+            _BRAIN_LOCK_DIR.parent.mkdir(parents=True, exist_ok=True)
+            _BRAIN_LOCK_DIR.mkdir()
+            acquired = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - _BRAIN_LOCK_DIR.stat().st_mtime > stale:
+                    shutil.rmtree(_BRAIN_LOCK_DIR, ignore_errors=True)
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.time() >= deadline:
+                break
+            time.sleep(0.05)
+        except OSError:
+            break  # 拿不到锁（权限/盘未挂载）就退化成原来的行为
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            shutil.rmtree(_BRAIN_LOCK_DIR, ignore_errors=True)
 
 
 class _Registry:
@@ -1132,6 +1244,19 @@ class MISMemoryStore(MemoryStore):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._pending_violations: List[Dict[str, Any]] = []
+        try:
+            _install_store_gate()  # provider 构造时再保证一次：类级写闸必须在本进程装上
+        except Exception:
+            pass
+
+    def _mutate(self, *args, **kwargs):
+        """所有写操作（add/replace/patch/remove/batch）的唯一落盘口。
+
+        2026-11-18：在这里套一把跨宿主写锁，和 DSH 侧 brain.js 共用
+        D:\agent-brain\.brain\lock，避免两边同时 read-modify-write 互相覆盖。
+        """
+        with _brain_write_lock():
+            return super()._mutate(*args, **kwargs)
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         if target in ("memory", "user"):
@@ -1481,6 +1606,12 @@ class MISProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         try:
+            _install_store_gate()  # 类级写闸：本进程无论怎么加载，都必须在第一次写之前装上
+            with open("/tmp/mis_gate_init.log", "a", encoding="utf-8") as _gf:
+                _gf.write(f"initialize gate installed file={__file__}\n")
+        except Exception:
+            pass
+        try:
             from hermes_cli.config import load_config
             config = load_config() or {}
             mem_cfg = config.get("memory", {}) or {}
@@ -1662,6 +1793,10 @@ class MISProvider(MemoryProvider):
                         parts.append(f"      → {s['hint']}")
                 if len(pending) > 3:
                     parts.append(f"  ...还有{len(pending)-3}条")
+                if len(pending) > 10:
+                    parts.append(
+                        f"  🚨 [MIS] pending 积压 {len(pending)} 条，超过 10 条阈值——请当轮处理，别让它继续堆。"
+                    )
                 parts.append(f"  处理：mis(action='resolve', pending_id=0, choice='match_skill'|'create_skill'|'shorten'|'force')")
 
         # 5. Violation scan (existing entries) — dedup per session so the
@@ -1750,6 +1885,28 @@ class MISProvider(MemoryProvider):
             result = _check_mis_policy_v2(content, self._store)
             if result.get("blocked"):
                 logger.warning("MIS violation in on_memory_write (%s/%s): %s", target, action, result.get("detail", "")[:200])
+                # Hermes 内核的 memory 是 agent-loop 工具，pre_tool_call 覆盖不到它
+                # （model_tools._AGENT_LOOP_TOOLS），只能写后回滚：把刚写进去的违规条目摘掉。
+                if action == "add":
+                    self._revert_blocked_add(target, content, result)
+
+    def _revert_blocked_add(self, target: str, content: str, result: Dict[str, Any]) -> None:
+        """把刚被判定违规的 add 结果从文件里摘掉（brain.js 负责加锁与原子写）。"""
+        try:
+            match = (content or "").strip()[:40]
+            if not match:
+                return
+            proc = subprocess.run(
+                ["node", str(_BRAIN_BIN), "remove", "--file", "USER" if target == "user" else "MEMORY", "--match", match],
+                capture_output=True, text=True, timeout=8,
+            )
+            try:
+                ok = bool(json.loads(proc.stdout or "{}").get("ok"))
+            except (ValueError, TypeError):
+                ok = False
+            logger.warning("MIS reverted blocked %s write (match=%r, ok=%s): %s", target, match, ok, result.get("reason"))
+        except Exception:
+            logger.warning("MIS revert failed for blocked write (match=%r)", (content or "")[:40], exc_info=True)
 
     # -- Session lifecycle hooks --------------------------------------------
 
@@ -2147,6 +2304,9 @@ class MISProvider(MemoryProvider):
                 "entries": deep_count,
             },
             "pending_write_failure": state.pending_write_failure is not None,
+            "pending_violations": {
+                "total": len(getattr(self._store, "_pending_violations", []) or []),
+            },
         }, ensure_ascii=False)
 
     def _handle_archive(self, args: Dict) -> str:
@@ -2438,3 +2598,135 @@ class MISProvider(MemoryProvider):
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# pre_tool_call 硬闸：memory 工具的写操作先过 brain.js 判定
+# 为什么在这里：MemoryProvider 只有写后钩子（on_memory_write），没有写前闸。
+# 结果：Hermes 与 DSH 同一份 policy.js，谁也绕不过去。
+# ---------------------------------------------------------------------------
+
+_WRITE_ACTIONS = {"add", "replace", "patch", "update", "append"}
+
+
+def _enforce_memory_tool(tool_name: str, args: Optional[dict] = None, session_id: str = "", **kwargs):
+    """memory 工具写操作前拦截；插件自身出错一律放行，不拖垮会话。"""
+    try:
+        if tool_name not in ("memory",):
+            return None
+        a = args or {}
+        action = str(a.get("action") or "").lower()
+        if action not in _WRITE_ACTIONS:
+            return None
+        content = a.get("content") or a.get("text") or a.get("new_text") or ""
+        if not isinstance(content, str) or not content.strip():
+            return None
+        target = str(a.get("target") or "memory")
+        decided = _brain_check(content, target)
+        if isinstance(decided, dict) and decided.get("ok") is False:
+            sug = " / ".join(
+                str(s.get("action") or "") for s in (decided.get("suggestions") or []) if isinstance(s, dict)
+            )
+            msg = f"[brain] {decided.get('reason') or 'policy'}: {decided.get('detail') or ''}"
+            if sug:
+                msg += f"｜可选：{sug}"
+            return {"action": "block", "message": msg}
+        return None
+    except Exception:
+        return None
+
+
+def register(ctx) -> None:
+    """插件入口：注册 memory 写入硬闸。"""
+    logger.warning("MIS register() called — registering pre_tool_call hook")
+    ctx.register_hook("pre_tool_call", _enforce_memory_tool)
+    logger.warning("MIS pre_tool_call hook registered")
+
+
+# ---------------------------------------------------------------------------
+# Store 层写闸（Hermes 侧唯一可靠的拦截点）
+#
+# 事实：memory 是 agent-loop 内联工具（model_tools._AGENT_LOOP_TOOLS），
+#   - pre_tool_call 钩子不触发；
+#   - MemoryProvider.get_tool_schemas() 里名为 "memory" 的 schema 会被
+#     _HERMES_CORE_TOOLS 过滤掉（provider 不能接管核心工具）；
+#   - on_memory_write 只在个别路径触发。
+# 但内联执行器最终落到 `MemoryStore.add(target, content)`（agent._memory_store）。
+# 所以在 Store 类上套一层：所有宿主路径的写入都必须先过 brain.js。
+# 幂等：模块被重复导入时只包一次。
+# ---------------------------------------------------------------------------
+
+_STORE_GATE_ATTR = "_mis_brain_gate_installed"
+
+
+def _install_store_gate() -> None:
+    try:
+        from tools.memory_tool import MemoryStore as _MS
+    except Exception:
+        return
+    if getattr(_MS, _STORE_GATE_ATTR, False):
+        return
+    orig_add = _MS.add
+
+    def gated_add(self, target: str, content: str):
+        try:
+            decided = _brain_check(content, target if target in ("memory", "user") else "memory")
+            if isinstance(decided, dict) and decided.get("ok") is False:
+                sug = " / ".join(
+                    str(x.get("action") or "") for x in (decided.get("suggestions") or []) if isinstance(x, dict)
+                )
+                msg = f"[brain] {decided.get('reason') or 'policy'}: {decided.get('detail') or ''}"
+                if sug:
+                    msg += f"｜可选：{sug}"
+                logger.warning("brain gate blocked %s add: %s", target, msg[:200])
+                return {
+                    "success": False,
+                    "error": msg,
+                    "reason": decided.get("reason"),
+                    "suggestions": decided.get("suggestions") or [],
+                }
+        except Exception:
+            pass
+        return orig_add(self, target, content)
+
+    _MS.add = gated_add
+
+    # 批量形状（operations[]）走 apply_batch，不经过 add
+    orig_batch = getattr(_MS, "apply_batch", None)
+    if callable(orig_batch):
+        def gated_batch(self, target: str, operations):
+            try:
+                for op in (operations or []):
+                    if not isinstance(op, dict):
+                        continue
+                    if str(op.get("action") or "add").lower() not in ("add", "patch"):
+                        continue
+                    text = op.get("content") or op.get("new_text") or ""
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+                    decided = _brain_check(text, target if target in ("memory", "user") else "memory")
+                    if isinstance(decided, dict) and decided.get("ok") is False:
+                        sug = " / ".join(
+                            str(x.get("action") or "") for x in (decided.get("suggestions") or []) if isinstance(x, dict)
+                        )
+                        msg = f"[brain] {decided.get('reason') or 'policy'}: {decided.get('detail') or ''}"
+                        if sug:
+                            msg += f"｜可选：{sug}"
+                        logger.warning("brain gate blocked %s batch: %s", target, msg[:200])
+                        return {
+                            "success": False,
+                            "error": msg,
+                            "reason": decided.get("reason"),
+                            "suggestions": decided.get("suggestions") or [],
+                        }
+            except Exception:
+                pass
+            return orig_batch(self, target, operations)
+
+        _MS.apply_batch = gated_batch
+
+    setattr(_MS, _STORE_GATE_ATTR, True)
+    logger.info("MIS brain gate installed on MemoryStore.add")
+
+
+_install_store_gate()

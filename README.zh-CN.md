@@ -9,6 +9,28 @@
 
 ---
 
+## ✨ v2.1（2026-11-20）：真实写闸 + 跨宿主同一份规则
+
+v4 文档里写的「实时写入拦截」在 Hermes 0.23 上**实际没有生效**：`memory` 是 agent-loop 内联工具
+（`model_tools._AGENT_LOOP_TOOLS`），既不经过 `pre_tool_call` 钩子，也不经过 `MemoryProvider.get_tool_schemas()`
+（核心工具名会被 `_HERMES_CORE_TOOLS` 过滤），`on_memory_write` 又只是写后回调。
+
+v2.1 改成**在 Store 层包装**，这是唯一真正落在写路径上的点：
+
+```
+memory 工具 → MemoryStore.add / MemoryStore.apply_batch
+                     ↓ node brain.js check
+              ok=false → 直接返回 {success:false, error:"[brain] …", suggestions}
+```
+
+- 类级幂等安装（`_install_store_gate()`），`initialize()` 与 store `__init__` 各保一次底；
+- 同时覆盖单条 `add` 与批量 `operations`（`apply_batch`）；
+- 判定逻辑**不在 Python 里再写一遍**，而是调用 `brain.js`（chips-brain 内核），与 DeepSeek Harness 共用同一份 `policy.js`；
+- `MIS_BRAIN_DISABLE=1` 可回退到纯本地策略（单测/离线用），brain.js 不可用时也会自动回退；
+- 已实测：死引用、结构化批量都被拦，合法索引正常写入。
+
+> 已知边界：Hermes 侧的写入只过 `check`，不进 `audit.jsonl`（审计完整的是 DSH 与 CLI 路径）。
+
 ## 🎯 MIS 是什么？
 
 MIS 是 Hermes MemoryProvider 插件，把默认的扁平记忆系统升级为三层架构：

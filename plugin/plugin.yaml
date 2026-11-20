@@ -1,5 +1,5 @@
 name: mis
-version: 2.0.0
-description: "MIS Memory Engine v2 — two-layer memory management with auto-archival, cross-layer search, access tracking, and write-failure recovery."
+version: 2.1.0
+description: "MIS Memory Engine v2.1 — two-layer memory with the policy delegated to chips-brain brain.js, a store-level write gate (add + apply_batch), auto-archival, cross-layer search and registry."
 author: FSWei
 homepage: https://github.com/FSWei/hermes-mis
