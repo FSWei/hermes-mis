@@ -198,15 +198,42 @@ def _check_mis_policy(content: str, store=None) -> Optional[str]:
     return None
 
 
-_BRAIN_BIN = Path("/mnt/d/agent-brain/.brain/bin/brain.js")
+_BRAIN_ROOT = Path(os.environ.get("BRAIN_ROOT") or Path.home() / "agent-brain")
+_BRAIN_BIN = _BRAIN_ROOT / ".brain" / "bin" / "brain.js"
 _BRAIN_CHECK_DISABLED = False  # 熔断开关：brain.js 不在/报错时自动回退本地策略
 
 
-def _brain_check(content: str, target: str = "memory") -> Optional[dict]:
+def _brain_node():
+    """返回 [node, brain.js 参数]；WSL 里没有 node 时退回 Windows node.exe。
+
+    2026-11-24 实测：WSL 的 PATH 里没有 node，_brain_check 一直在抛异常并静默
+    回退本地策略，跨宿主同一实现没生效。node.exe 需要 Windows 形式的脚本路径。
+    """
+    import re as _re
+    import shutil as _sh
+
+    script = str(_BRAIN_BIN)
+    node = _sh.which("node")
+    if node:
+        return [node, script]
+    for cand in (os.environ.get("NODE_BIN"), "/mnt/c/Program Files/nodejs/node.exe",
+                 str(Path.home() / "nodejs" / "node.exe")):
+        if Path(cand).exists():
+            m = _re.match(r"^/mnt/([A-Za-z])/(.*)$", script)
+            win = m.group(1).upper() + ":\\" + m.group(2).replace("/", "\\") if m else script
+            return [cand, win]
+    return []
+
+
+def _brain_check(content: str, target: str = "memory", allow_duplicate: bool = False) -> Optional[dict]:
     """把写判定委托给 brain.js —— 与 DSH 侧执行同一份规则（policy.js）。
 
     返回 {"ok": bool, ...} 或 None（不可用/出错，由本地 _check_mis_policy_v2 兜底）。
     只读，不拿锁，不会与写入死锁。
+
+    allow_duplicate=True：只给“写后复检”用。写后复检时这条内容已经躺在文件里，
+    brain.js 的查重必然命中自己 → 误判 duplicate → on_memory_write 会把它回滚掉，
+    所以复检要把 duplicate 当作通过（真正的重复在写前闸就拦住了）。
     """
     global _BRAIN_CHECK_DISABLED
     if _BRAIN_CHECK_DISABLED or not _BRAIN_BIN.exists():
@@ -220,8 +247,11 @@ def _brain_check(content: str, target: str = "memory") -> Optional[dict]:
     except Exception:
         pass
     try:
+        cmd = _brain_node()
+        if not cmd:
+            return None
         proc = subprocess.run(
-            ["node", str(_BRAIN_BIN), "check", "--file", "USER" if target == "user" else "MEMORY", "--text", content],
+            cmd + ["check", "--file", "USER" if target == "user" else "MEMORY", "--text", content],
             capture_output=True, text=True, timeout=8,
         )
         out = (proc.stdout or "").strip()
@@ -233,15 +263,38 @@ def _brain_check(content: str, target: str = "memory") -> Optional[dict]:
             data = json.loads(out.splitlines()[-1])
         if not isinstance(data, dict) or "ok" not in data:
             return None
+        if allow_duplicate and data.get("ok") is False and data.get("reason") == "duplicate":
+            return {"ok": True, "self_duplicate": True}
         return data
     except Exception:
         return None
 
 
-def _check_mis_policy_v2(content: str, store=None) -> dict:
+_HARD_IP_RE = re.compile(r"(?<![\w.-])(?:\d{1,3}\.){3}\d{1,3}(?![\w.-])")
+_HARD_CRED_RE = re.compile(
+    r"(?:密码|口令|password|passwd|pwd|token|secret|api[\s_-]?key|私钥|凭据|credentials?)\s*[：:=]\s*\S+", re.I
+)
+_HARD_PORT_RE = re.compile(r"(?:端口|port)\s*[：:=]?\s*\d{2,5}(?!\d)", re.I)
+
+
+def _hard_domain_hits(text: str) -> list:
+    """凭据 / IPv4 / 端口：不看字数、不放行索引行（与 policy.js 的 HARD_DOMAIN_PATTERNS 同口径）。"""
+    hits = []
+    m = _HARD_IP_RE.search(text or "")
+    if m and all(int(o) <= 255 for o in m.group(0).split(".")):
+        hits.append("IP 地址")
+    if _HARD_CRED_RE.search(text or ""):
+        hits.append("凭据")
+    if _HARD_PORT_RE.search(text or ""):
+        hits.append("端口号")
+    return hits
+
+
+def _check_mis_policy_v2(content: str, store=None, post_write: bool = False) -> dict:
     """Structured policy check with resolution suggestions.
 
     优先委托 brain.js（跨宿主同一份规则）；brain.js 不可用时用下面的本地实现。
+    post_write=True 表示这是写入后的复检：跳过“和自己重复”的判定。
     """
     content = content.strip()
     if not content:
@@ -253,7 +306,7 @@ def _check_mis_policy_v2(content: str, store=None) -> dict:
             target = getattr(store, "target", target) or target
     except Exception:
         target = "memory"
-    decided = _brain_check(content, target)
+    decided = _brain_check(content, target, allow_duplicate=post_write)
     if isinstance(decided, dict):
         if decided.get("ok") is False:
             return {
@@ -264,6 +317,17 @@ def _check_mis_policy_v2(content: str, store=None) -> dict:
             }
         if decided.get("ok") is True:
             return {"blocked": False}
+
+    # 硬规则（2026-11-21）：凭据 / IP / 端口无条件拦，与 policy.js 的 HARD_DOMAIN_PATTERNS 同口径。
+    # 这一段只在 brain.js 不可用时兜底，但规则必须一致，否则宿主切换实现会漏。
+    hard = _hard_domain_hits(content)
+    if hard:
+        return {
+            "blocked": True,
+            "reason": "domain_details",
+            "detail": f"[hard] 含敏感或项目细节（{', '.join(hard)}），凭据/IP/端口必须进 skill",
+            "suggestions": _build_suggestions(content, "domain_details"),
+        }
 
     # Index line format → always allowed
     if _INDEX_LINE_RE.match(content):
@@ -592,9 +656,9 @@ _REGISTRY_FILE = "registry.json"
 # ---------------------------------------------------------------------------
 # 跨宿主写锁（2026-11-18）
 # 与 DSH 侧 .brain/bin/brain.js 共用同一把锁：D:\agent-brain\.brain\lock
-# （WSL 侧路径 /mnt/d/agent-brain/.brain/lock）。mkdir 在 NTFS 上是原子的。
+# （WSL 侧路径 <brain>/.brain/lock）。mkdir 在 NTFS 上是原子的。
 # 超时不硬等：宁可裸写一次，也不能把记忆写入卡死。
-_BRAIN_LOCK_DIR = Path("/mnt/d/agent-brain/.brain/lock")
+_BRAIN_LOCK_DIR = _BRAIN_ROOT / ".brain" / "lock"
 
 
 @contextmanager
@@ -1259,7 +1323,7 @@ class MISMemoryStore(MemoryStore):
             return super()._mutate(*args, **kwargs)
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
-        if target in ("memory", "user"):
+        if target in ("memory", "user") and not _brain_available():
             # Cross-store duplicate check first (2026-09-24): same topic or
             # >60% similar content in EITHER store → block with merge hints.
             dup = self._find_duplicate(target, content)
@@ -1340,7 +1404,7 @@ class MISMemoryStore(MemoryStore):
         return None
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
-        if target in ("memory", "user"):
+        if target in ("memory", "user") and not _brain_available():
             # Duplicate check excludes the entry being replaced (its own topic match is expected)
             dup = self._find_duplicate(target, new_content, exclude_old=old_text)
             if dup:
@@ -1383,7 +1447,7 @@ class MISMemoryStore(MemoryStore):
         return super().replace(target, old_text, new_content)
 
     def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
-        if target in ("memory", "user"):
+        if target in ("memory", "user") and not _brain_available():
             for i, op in enumerate(operations):
                 op = op or {}
                 act = op.get("action")
@@ -1882,7 +1946,7 @@ class MISProvider(MemoryProvider):
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:
         if target in ("memory", "user") and action in {"add", "replace"}:
-            result = _check_mis_policy_v2(content, self._store)
+            result = _check_mis_policy_v2(content, self._store, post_write=True)
             if result.get("blocked"):
                 logger.warning("MIS violation in on_memory_write (%s/%s): %s", target, action, result.get("detail", "")[:200])
                 # Hermes 内核的 memory 是 agent-loop 工具，pre_tool_call 覆盖不到它
@@ -1896,8 +1960,11 @@ class MISProvider(MemoryProvider):
             match = (content or "").strip()[:40]
             if not match:
                 return
+            cmd = _brain_node()
+            if not cmd:
+                return
             proc = subprocess.run(
-                ["node", str(_BRAIN_BIN), "remove", "--file", "USER" if target == "user" else "MEMORY", "--match", match],
+                cmd + ["remove", "--file", "USER" if target == "user" else "MEMORY", "--match", match],
                 capture_output=True, text=True, timeout=8,
             )
             try:
@@ -2659,6 +2726,39 @@ def register(ctx) -> None:
 _STORE_GATE_ATTR = "_mis_brain_gate_installed"
 
 
+def _brain_audit(target: str, action: str, chars: int) -> None:
+    """写成功后补一条审计（agent=hermes）。
+
+    MIS 的闸门只调 brain.js check（只判不写），放行后由原生 MemoryStore 自己落盘，
+    所以 audit.jsonl 里看不到 Hermes 的新增。这里在「确认写入成功之后」补记，
+    避免留下假记录。
+    """
+    cmd = _brain_node()
+    if not cmd:
+        return
+    try:
+        subprocess.run(
+            cmd + ["audit", "--action", action,
+                   "--file", "USER" if target == "user" else "MEMORY",
+                   "--chars", str(max(0, int(chars))), "--agent", "hermes"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except Exception:
+        pass
+
+
+def _brain_available() -> bool:
+    """brain.js 是否可用（node 能解析且脚本存在）。
+
+    可用时本地旧引擎只作兜底：inline memory 工具走原生 MemoryStore + 类级闸门，
+    判定以 brain 为准；provider 路径上也不允许旧规则先于新规则把人拦下来。
+    """
+    try:
+        return bool(_brain_node()) and _BRAIN_BIN.exists()
+    except Exception:
+        return False
+
+
 def _install_store_gate() -> None:
     try:
         from tools.memory_tool import MemoryStore as _MS
@@ -2687,7 +2787,14 @@ def _install_store_gate() -> None:
                 }
         except Exception:
             pass
-        return orig_add(self, target, content)
+        result = orig_add(self, target, content)
+        try:
+            failed = isinstance(result, dict) and result.get("success") is False
+            if not failed:
+                _brain_audit(target, "append", len(content or ""))
+        except Exception:
+            pass
+        return result
 
     _MS.add = gated_add
 
@@ -2721,7 +2828,18 @@ def _install_store_gate() -> None:
                         }
             except Exception:
                 pass
-            return orig_batch(self, target, operations)
+            result = orig_batch(self, target, operations)
+            try:
+                failed = isinstance(result, dict) and result.get("success") is False
+                if not failed:
+                    _chars = sum(
+                        len(str((op or {}).get("content") or (op or {}).get("new_text") or ""))
+                        for op in (operations or []) if isinstance(op, dict)
+                    )
+                    _brain_audit(target, "apply_ops", _chars)
+            except Exception:
+                pass
+            return result
 
         _MS.apply_batch = gated_batch
 

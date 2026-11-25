@@ -1,5 +1,7 @@
 name: mis
-version: 2.1.0
-description: "MIS Memory Engine v2.1 — two-layer memory with the policy delegated to chips-brain brain.js, a store-level write gate (add + apply_batch), auto-archival, cross-layer search and registry."
+version: 3.1.0
+description: "MIS Memory Engine v3.1 — index-level memory policy, three legal entry shapes, archive pipeline, 60% similarity dedupe; policy delegated to the chips-brain kernel (brain.js) when present."
 author: FSWei
 homepage: https://github.com/FSWei/hermes-mis
+hooks:
+  - on_memory_write
